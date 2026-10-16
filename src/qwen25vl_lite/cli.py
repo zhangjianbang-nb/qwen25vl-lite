@@ -209,7 +209,9 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--max-num-seqs", type=int, default=8)
         p.add_argument("--max-num-batched-tokens", type=int, default=4096)
         p.add_argument("--max-model-len", type=int, default=32768)
-        p.add_argument("--kv-dtype", default="float16", choices=["float16", "bfloat16", "float32", "int8"])
+        p.add_argument("--kv-dtype", default=None,
+                       choices=["float16", "bfloat16", "float32", "int8"],
+                       help="KV storage dtype; defaults to --dtype (use int8 for a quantised cache)")
         p.add_argument("--quantize-kv", action="store_true")
         p.add_argument("--no-prefix-cache", action="store_true")
         p.add_argument("--no-chunked-prefill", action="store_true")

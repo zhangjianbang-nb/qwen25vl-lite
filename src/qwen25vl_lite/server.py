@@ -282,7 +282,8 @@ def make_handler(service: EngineService):
                     "data": [{"id": self.service_ref.model_name, "object": "model", "owned_by": "local"}],
                 })
             else:
-                self._send_json({"error": "not found"}, status=404)
+                self._send_json({"error": {"message": "not found", "type": "invalid_request_error"}},
+                            status=404)
 
         def do_POST(self):  # noqa: N802
             try:
@@ -296,7 +297,8 @@ def make_handler(service: EngineService):
             elif self.path.startswith("/v1/completions"):
                 self._handle_completion(body)
             else:
-                self._send_json({"error": "not found"}, status=404)
+                self._send_json({"error": {"message": "not found", "type": "invalid_request_error"}},
+                            status=404)
 
         def _handle_chat(self, body: Dict[str, Any]) -> None:
             tier = body.get("vision_tier", "full")
@@ -417,7 +419,11 @@ def make_handler(service: EngineService):
                 self._send_json({
                     "id": completion_id, "object": "text_completion", "created": created,
                     "model": self.service_ref.model_name,
-                    "choices": [{"index": 0, "text": text, "finish_reason": final.finish_reason}],
+                    "choices": [{"index": 0, "text": text, "finish_reason": final.finish_reason,
+                                 # Extension field: with no tokenizer `text` is empty, and the
+                                 # token ids are then the only usable payload.  Present either way
+                                 # so a client can rely on it.
+                                 "token_ids": list(final.output_token_ids)}],
                     "usage": {
                         "prompt_tokens": final.num_prompt_tokens,
                         "completion_tokens": final.num_output_tokens,

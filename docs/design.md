@@ -29,7 +29,7 @@ underestimated all three of the latter.
 | `cache` | block manager, paged KV, radix prefix cache | `test_components.py` |
 | `vision_budget` | resolution budget, pooling, ToME, FastV | `test_components.py` |
 | `planner` | memory planning | `test_components.py::test_plan_*` |
-| `offload` | static placement + prefetch | logic unit-tested; transfers must be measured |
+| `offload` | static placement + prefetch | `test_components.py::test_offload_*`; transfers must be measured on device |
 | `engine` | scheduling | `test_engine.py` |
 
 ## Decisions that changed after the external review
@@ -87,8 +87,8 @@ backend on some devices. **[review 2026-10-15]**
 So the engine **probes empirically** (`attention.probe_backends`): it runs a real SDPA call
 inside each backend's context manager and records the outcome. On CPU, the fused backends are
 reported as "not applicable on this device" rather than "available", because torch does not
-raise when they are requested there. The chosen list is printed at startup and exposed on
-`/health`.
+raise when they are requested there. The chosen list is exposed on `/health`, and `cli.py bench` prints it
+before running; the server itself logs only its bind address.
 
 ### 5. Offload: static placement, not an LRU
 

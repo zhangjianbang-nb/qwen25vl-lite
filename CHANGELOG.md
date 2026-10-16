@@ -41,7 +41,7 @@ GPU-measured performance numbers ship with it (see "Not included" below).
   machine's reclaimable memory.
 - **Quality gates** (`scripts/quality_gate.py`): Gate A against `transformers`, Gate B per
   quantisation scheme, Gate C per vision tier. Runnable without a real checkpoint (`--tiny`).
-- **Tests**: 116 tests, CPU-only, no checkpoint download. Includes a 20-combination chunked
+- **Tests**: 125 tests, CPU-only, no checkpoint download. Includes a 20-combination chunked
   prefill equivalence matrix, step-by-step paged-decode parity with HF, batched-vs-sequential
   decode parity, prefix-cache reuse parity, greedy generation parity with
   `transformers.generate`, and a multimodal case with a large enough image to engage windowed
@@ -81,8 +81,8 @@ not reached. All four are fixed, and each now has a test:
   logits of order 1-10: a correct float32 result can exceed it. It now uses the same relative
   criterion as the test suite (`atol=1e-4, rtol=1e-3`).
 
-Also: `RequestOutput.metrics` now carries `ttft_s`. The README advertised TTFT but the engine
-never recorded it, so the benchmark had nothing to read.
+Also: `RequestOutput.metrics` now carries `ttft_s`. The benchmark asked for TTFT but the
+engine never recorded it, so it had nothing to read.
 
 ### Fixed after CI (2026-10-15)
 
@@ -105,7 +105,7 @@ Two changes:
   and skip with an explicit reason on versions whose convention differs. The end-to-end
   equivalence tests run on every version and pass on both 5.16.1 and 5.20.
 
-Result: `pytest tests/` → 116 passed on 5.16.1; 116 passed, 2 skipped on 5.20. (Note that
+Result: `pytest tests/` → 125 passed on 5.16.1; 125 passed, 2 skipped on 5.20. (Note that
 `pyproject.toml` already sets `addopts = "-q"`, so adding `-q` again suppresses the summary
 line — the counts above come from `pytest tests/`.)
 
@@ -153,8 +153,9 @@ the release bar, and every substantive finding is fixed here with a regression t
   and double-counting hits. `_adopt_prefix` is now idempotent and adoption happens after the
   "nothing left to prefill" check.
 - `EngineConfig` now validates the tier itself, so the `pruned` tier's FastV settings cannot
-  bypass validation; an unknown tier raises a message listing the valid names; a fractional
-  `second_per_grid_ts` is refused instead of silently truncated.
+  bypass validation, and an unknown tier raises a message listing the valid names. Separately,
+  `rope.py` refuses a fractional `second_per_grid_ts` instead of silently truncating it (the
+  check lives with the position-id arithmetic, not in the config).
 
 **Tests that asserted nothing**
 
@@ -182,6 +183,75 @@ the release bar, and every substantive finding is fixed here with a regression t
   All corrected.
 - The server's streaming `/v1/completions` emitted a terminal event typed
   `chat.completion.chunk`; it now matches the stream's `text_completion`.
+
+### Fixed after the third validation round (2026-10-16)
+
+Two independent reviewers were run against the published tree; both had to name at least ten
+defects. What they found, and what changed:
+
+- **Prefix-cache reference leak (blocker).** `RadixPrefixCache.match` raises the user count on
+  every node it walks, but a sequence keeps one token back for prefill, so a prompt whose
+  length is an exact multiple of `block_size` adopts one node fewer than it matched. The
+  surplus node stayed pinned forever — never evictable, its block never returned. `_adopt_prefix`
+  now releases the nodes it discards, and the aligned case has its own regression test.
+- **FastV double normalisation.** `TextModel.forward` applied the final RMSNorm whenever the
+  layer slice reached the end of the stack, so a prune layer equal to the last layer normalised
+  the hidden states twice. The norm is now applied only by a full-stack call
+  (`stop_layer is None`).
+- **INT4 `axis=1` dequantised transposed.** The quantiser transposes before grouping along K;
+  the dequantiser never undid it, returning a `[K, N]` reconstruction for an `[N, K]` weight.
+  Fixed, and pinned by a test.
+- **`plan_memory` counted offloaded layers as resident.** `gpu_bytes` added the whole
+  `weights_bytes` even when layers had been placed in host memory, so the reported footprint
+  could exceed the budget the plan was built from. The planner now separates the always-resident
+  weights (vision tower, embeddings, head) from the decoder linears, reports `gpu_weights_bytes`,
+  and refuses to claim a layer fits when the resident weights alone do not.
+- **`EngineConfig.kv_dtype` did nothing.** The field was never read. It is now the single source
+  of truth for KV storage: `None` means "the compute dtype", `int8` selects the quantised
+  layout, and the float names select the storage width.
+- **A prune layer beyond the model depth failed mid-request.** `ModelRunner` now refuses such a
+  config at construction and names the depth, instead of raising "expected attention
+  probabilities" from inside a forward pass.
+- **FastV rewrote the caller's prompt.** The response reported the pruned token list, so
+  `prompt_tokens` disagreed with what was submitted. `SequenceState` keeps the submitted ids and
+  the response reports those; `vision_tokens_total` now counts the image tokens that were
+  actually prefilled rather than the pre-prune count.
+- **`bench/run_bench.py --quant int4` crashed.** The flag value was passed straight to
+  `apply_quantization`, which expects a scheme name; the documented example command died on
+  "unknown scheme 'int4'". The mapping now lives in `_SCHEMES`. Running the script end to end
+  (rather than reading it) surfaced three more defects on the same path: it read
+  `plan.gpu_kv_tokens` and `cfg.text`, neither of which exists; it allocated the planner's whole
+  *capacity* figure as blocks, which on a small model is millions of blocks and gets the process
+  OOM-killed; it built the engine without the dtype the weights were loaded at, so every
+  attention call failed on a dtype mismatch; and its pseudo-prompt could contain the image
+  placeholder, which the engine correctly refuses without pixels. All four are fixed, and the
+  pool is now capped at what the run can actually use.
+- **The CLI defaulted `--kv-dtype` to `float16` while `--dtype` defaulted to `float32`**, so
+  `qwen25vl-lite generate` failed on a dtype mismatch out of the box. `--kv-dtype` now defaults
+  to `None`, meaning "the compute dtype".
+- **`BlockManager.fork` was laxer than `free_blocks`.** It invented a refcount entry for an
+  unknown block id, hiding exactly the ownership bug `free_blocks` was hardened against. It is
+  strict now.
+- **`PagedKVCache.copy_blocks` claimed a use it does not have.** The docstring said preemption
+  copied blocks; preemption actually swaps them. The docstring says what the method is for.
+- **`/v1/completions` returned an empty string with no tokenizer.** The generated ids are now
+  returned in `choices[0]["token_ids"]` (an extension field), so the endpoint is usable without
+  a tokenizer, and the README says so instead of claiming plain text works.
+- **Two 404 responses used a bare string** where every other error path returns the OpenAI error
+  object. Both are objects now.
+- **Documentation claims that the code did not support**: `offload` was described as wired into
+  the engine (it is a library the engine never instantiates — `plan_memory` reports the
+  arithmetic, and `report` is a dataclass, so `report.summary()` is what prints); `README`
+  attributed the tiny fixture to the test suite (the suite builds its own, in `tests/conftest.py`);
+  `CHANGELOG` attributed the `second_per_grid_ts` check to `EngineConfig` (it lives in `rope.py`)
+  and claimed the README advertised TTFT (it did not); `design.md` said the backend list is
+  printed at startup (it is exposed on `/health`, and only `bench` prints it).
+- **Tests that asserted nothing meaningful** were strengthened: the "three context numbers" test
+  now checks they are three *distinct* quantities rather than three labels, and the planner's
+  offload branch — previously uncovered — has its own test.
+- `offload` gained the tests its docstring claimed, `vision_budget.apply_fastv` is now the single
+  pruning implementation (the engine had a second, untested copy), and FastV's own regression
+  test observes pruning through the statistic instead of the rewritten prompt.
 
 ### Not included
 

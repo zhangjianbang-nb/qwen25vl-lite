@@ -103,3 +103,12 @@ def test_non_streaming_response_is_a_single_json_object():
     payload = rec.json[0]
     assert payload["choices"][0]["message"]["content"] == "ABC"
     assert payload["choices"][0]["finish_reason"] == "stop"
+
+
+def test_completions_always_returns_token_ids():
+    """With no tokenizer `text` is an empty string, so the endpoint would be useless without the
+    token ids.  They are an extension field and are present either way."""
+    rec = _run([_Update([1, 2, 3], finish_reason="stop")], chat=False, body={"stream": False})
+    choice = rec.json[0]["choices"][0]
+    assert choice["token_ids"] == [1, 2, 3]
+    assert choice["text"] == "ABC"  # the fake service has a decoder; the field is still there

@@ -57,9 +57,23 @@ class BlockManager:
         return out
 
     def fork(self, blocks: Sequence[int]) -> None:
-        """Add one reference to each block (used when a sequence adopts a cached prefix)."""
+        """Add one reference to each block (used when a sequence adopts a cached prefix).
+
+        Validated with the same strictness as :meth:`free_blocks`.  The lenient version used
+        ``refcount.get(b, 0) + 1``, which would happily invent an entry for a stale or
+        out-of-range id and thereby hide an ownership bug -- the exact failure mode
+        ``free_blocks`` was hardened against.
+        """
         for b in blocks:
-            self.refcount[b] = self.refcount.get(b, 0) + 1
+            b = int(b)
+            if not 0 <= b < self.num_blocks:
+                raise ValueError(f"block id {b} is outside [0, {self.num_blocks})")
+            rc = self.refcount.get(b)
+            if rc is None:
+                raise ValueError(f"block {b} was never allocated; cannot fork it")
+            if rc <= 0:
+                raise ValueError(f"block {b} is already free; cannot fork it")
+            self.refcount[b] = rc + 1
 
     def free_blocks(self, blocks: Sequence[int]) -> None:
         """Release one reference to each block.
@@ -441,7 +455,13 @@ class PagedKVCache:
         return k_out, v_out
 
     def copy_blocks(self, src_blocks: Sequence[int], dst_blocks: Sequence[int]) -> None:
-        """Copy physical blocks (used by swap/preemption instead of re-prefilling)."""
+        """Copy physical blocks wholesale.
+
+        A utility for block-table remapping, and deliberately unused: preemption goes through
+        ``swap_out``/``swap_in`` because a swapped sequence is restored into freshly allocated
+        blocks rather than the ones it had, so there is nothing to copy in place.  Kept (and
+        unit-tested) because a future shared-prefix scheme would need exactly this primitive.
+        """
         src = torch.tensor(list(src_blocks), device=self.device, dtype=torch.long)
         dst = torch.tensor(list(dst_blocks), device=self.device, dtype=torch.long)
         self.k[:, dst] = self.k[:, src]
@@ -494,6 +514,10 @@ class SequenceState:
     seq_id: int
     prompt_token_ids: List[int]
     block_size: int
+    # What the caller actually submitted.  FastV rewrites `prompt_token_ids` in place (it drops
+    # the pruned image placeholders), so reporting the rewritten list back would hand the caller
+    # a prompt it never sent and make prompt_tokens billing disagree with its own input.
+    submitted_prompt_token_ids: List[int] = field(default_factory=list)
     sampling_params: dict = field(default_factory=dict)
     priority: int = 0
     output_token_ids: List[int] = field(default_factory=list)

@@ -40,7 +40,7 @@ qwen25vl-lite serve --model ./Qwen2.5-VL-3B-Instruct --device cuda --weight-dtyp
 
 ```
 $ python -m pytest tests/
-116 passed in ~7s
+125 passed in ~8s
 ```
 
 Everything runs on CPU with tiny random weights and **no model download**, so the suite is
@@ -138,7 +138,8 @@ qwen25vl_lite/
 ```
 
 Supporting scripts: `scripts/demo.py` (end-to-end walkthrough), `scripts/make_tiny_model.py`
-(the random fixture used by the gates and tests), `scripts/quality_gate.py` (Gates A/B/C),
+(the random fixture used by `--tiny` in the gates and by the demo; the test suite builds its
+own fixture in-process, see `tests/conftest.py`), `scripts/quality_gate.py` (Gates A/B/C),
 `bench/run_bench.py` (throughput and memory on your hardware).
 
 ### The five things that make it fit in 8 GB
@@ -217,12 +218,19 @@ producing a partially-pruned sequence.
 
 ### Offload: static placement, not an LRU
 
-The review's recommendation is followed: layers are placed **statically** (`gpu_layers` stay
-resident, the rest stream from pinned host memory) with double-buffered prefetch, because a
-decoder visits layers in a fixed order and an LRU cannot reduce total weight traffic — it
-only adds jitter. `offload.StaticLayerOffloader.report` prints the effective H2D bandwidth and
-the overlap ratio, which is the number that tells you whether streaming is actually paying
-off or has become transfer-bound.
+The review's recommendation is followed in the *design*: layers are placed **statically**
+(`gpu_layers` stay resident, the rest stream from pinned host memory) with double-buffered
+prefetch, because a decoder visits layers in a fixed order and an LRU cannot reduce total
+weight traffic — it only adds jitter.
+
+**This is a library, not a wired-in feature.** `offload.StaticLayerOffloader` implements the
+placement arithmetic (`placement_for`), the prefetch/materialise bookkeeping, and the report;
+its scheduling logic is unit-tested in `tests/test_components.py`. But nothing in
+`engine.py`, `cli.py` or `bench/run_bench.py` instantiates it, so loading a model through the
+engine keeps **every** layer resident. `plan_memory` still reports how many layers *would*
+fit and how many bytes would then be resident (`gpu_bytes` counts only those), which is the
+number the planner exists to produce. `report` is an `OffloadReport` dataclass —
+`report.summary()` is what prints the effective H2D bandwidth and the overlap ratio.
 
 ## Quality gates
 
@@ -276,8 +284,10 @@ Stated plainly, because the alternative is a user discovering them:
 * The `awq_style` scheme needs calibration statistics; without them it silently degrades to
   plain groupwise INT4 (the code says so in a comment rather than pretending).
 * No CUDA graphs, no custom kernels, no tensor parallelism.
-* The server needs a tokenizer for chat requests; `/v1/completions` with
-  `prompt_token_ids` works without one.
+* The server needs a tokenizer to produce text. `/v1/completions` accepts `prompt_token_ids`
+  and always returns the generated ids in `choices[0]["token_ids"]` (an extension field); with
+  no tokenizer the `text` field is an empty string, so a client without a tokenizer should read
+  the ids.
 * `bench/` and the CLI can produce numbers, but this repository ships none that were measured
   on a GPU.
 
@@ -285,7 +295,7 @@ Stated plainly, because the alternative is a user discovering them:
 
 ```bash
 pip install -e ".[dev]"              # pytest + the pinned transformers
-python -m pytest tests/              # 116 tests, CPU-only, no downloads
+python -m pytest tests/              # 125 tests, CPU-only, no downloads
 python -m pytest tests/test_model_vs_hf.py    # the equivalence gate on its own
 python -m pytest tests/test_chunked_prefill.py
 ```
@@ -300,7 +310,7 @@ between releases, and 5.20 did: it renamed a rotary-embedding class, replaced
 the cos/sin tables. So "matches transformers" is a claim about a version, not a moving target.
 The two tests that inspect HF internals use instantiated modules rather than private class
 names and skip with a stated reason on other versions; the end-to-end equivalence tests run
-everywhere. On the pinned 5.16.1 the suite is 116 passed; under 5.20 it is 116 passed,
+everywhere. On the pinned 5.16.1 the suite is 125 passed; under 5.20 it is 125 passed,
 2 skipped. That second number was produced by running the suite in a scratch virtualenv with
 `pip install -U transformers`; it is not reproducible from the pinned `dev` extra by design,
 because the pin exists to keep CI on the verified version.

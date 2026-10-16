@@ -71,6 +71,7 @@ class MemoryPlan:
     max_num_batched_tokens: int
     gpu_layers: int
     cpu_layers: int
+    gpu_weights_bytes: float
     activation_reserve_bytes: float
     runtime_reserve_bytes: float
     kv_dtype: str
@@ -83,12 +84,20 @@ class MemoryPlan:
 
     @property
     def gpu_bytes(self) -> float:
-        return self.weights_bytes + self.kv_pool_bytes + self.activation_reserve_bytes + self.runtime_reserve_bytes
+        """Bytes that must actually be resident on the device.
+
+        Offloaded decoder layers are *not* counted: they live in host memory and stream in, so
+        adding the whole ``weights_bytes`` here would overstate the footprint and could report a
+        total that exceeds the very budget the plan was built from.
+        """
+        return (self.gpu_weights_bytes + self.kv_pool_bytes
+                + self.activation_reserve_bytes + self.runtime_reserve_bytes)
 
     def summary(self) -> str:
         lines = [
             "memory plan",
-            f"  weights ({self.weight_dtype:<5})        {format_bytes(self.weights_bytes)}",
+            f"  weights ({self.weight_dtype:<5})        {format_bytes(self.weights_bytes)}"
+            + (f" ({format_bytes(self.gpu_weights_bytes)} on GPU)" if self.cpu_layers else ""),
             f"  KV per token             {self.kv_per_token/1024:.1f} KiB",
             f"  GPU-resident KV pool     {format_bytes(self.kv_pool_bytes)} ({self.kv_pool_tokens:,} tokens, {self.kv_dtype})",
             f"  vision/prefill reserve   {format_bytes(self.activation_reserve_bytes)}",
@@ -138,7 +147,12 @@ def plan_memory(
     text_float = text_params * text_nonlinear_share
 
     bytes_w = bytes_per_weight(weight_dtype, group_size)
-    weights_bytes = text_quantised * bytes_w + (text_float + vision_params) * 2.0
+    # Split the weights into the part that is *always* resident (vision tower, embeddings, norms,
+    # head) and the decoder linears, which are the only thing layer offloading can move.  Keeping
+    # them separate is what lets `gpu_bytes` count the resident subset honestly.
+    decoder_bytes = text_quantised * bytes_w
+    non_layer_bytes = (text_float + vision_params) * 2.0
+    weights_bytes = decoder_bytes + non_layer_bytes
 
     kv = kv_bytes_per_token(cfg, kv_dtype)
     kv_per_token = kv.per_token
@@ -167,25 +181,35 @@ def plan_memory(
         kv_pool_tokens = int(remaining // kv_per_token)
 
     total_layers = cfg.text_config.num_hidden_layers
-    # Per-layer cost must be derived from the same quantity that produced `weights_bytes`, or
-    # the two numbers do not reconcile: `weights_bytes` is the quantised text weights plus the
-    # float text weights plus the whole vision tower.
-    per_layer_bytes = weights_bytes / max(total_layers, 1)
+    # A decoder layer's cost is its own share of `decoder_bytes`; the always-resident weights are
+    # not divided across layers, because offloading a layer does not move them.
+    per_layer_bytes = decoder_bytes / max(total_layers, 1)
 
     if weights_bytes > usable - activation_reserve - reserve:
         # Not everything fits: keep whole layers resident and stream the rest.  The KV pool was
         # sized from `remaining`, which already had the weights subtracted, so it must be added
-        # back before deciding how many layers fit.
+        # back before deciding how many layers fit -- and the always-resident weights are
+        # subtracted first, because no amount of offloading removes them.
         head_room = max(usable - activation_reserve - reserve - kv_pool_tokens * kv_per_token, 0.0)
-        gpu_layers = int(min(total_layers, head_room // per_layer_bytes))
+        gpu_layers = int(min(total_layers, max(0.0, head_room - non_layer_bytes) // per_layer_bytes))
         notes.append(
-            f"only {gpu_layers}/{total_layers} decoder layers fit on device; the rest stream from "
-            "pinned host memory (see offload.StaticLayerOffloader).  Expect decode throughput to be "
-            "PCIe-bound for the streamed layers."
+            f"only {gpu_layers}/{total_layers} decoder layers fit on device; the rest would have to "
+            "stream from pinned host memory (offload.StaticLayerOffloader implements the placement "
+            "arithmetic and double-buffered prefetch, but the engine does not wire it up -- loading "
+            "the model through the engine keeps every layer resident).  Expect decode throughput to "
+            "be PCIe-bound for any layer that does stream."
         )
+        if gpu_layers == 0:
+            notes.append(
+                "not even one decoder layer fits alongside the vision tower and the embedding/head "
+                "matrices; this device cannot host the model, resident or streamed."
+            )
     else:
         gpu_layers = total_layers
     cpu_layers = total_layers - gpu_layers
+    # Only the resident subset is counted: the vision tower, embeddings, norms and head are always
+    # on the device, and the offloaded decoder layers are not.
+    gpu_weights_bytes = non_layer_bytes + gpu_layers * per_layer_bytes
 
     if max_num_seqs is None:
         # A sequence needs at least one prompt's worth of KV; assume a modest 2048-token
@@ -231,6 +255,7 @@ def plan_memory(
         activation_reserve_bytes=activation_reserve,
         runtime_reserve_bytes=reserve,
         kv_dtype=kv_dtype,
+        gpu_weights_bytes=gpu_weights_bytes,
         weight_dtype=weight_dtype,
         notes=notes,
     )

@@ -230,4 +230,9 @@ class TextModel(nn.Module):
                 hidden_states, probs = hidden_states
             if layer_hook is not None:
                 hidden_states = layer_hook(i, hidden_states, probs)
-        return self.norm(hidden_states) if stop >= len(self.layers) else hidden_states
+        # Only a full-stack call ends with the final norm.  A partial call (``stop_layer`` set)
+        # returns raw hidden states so the caller can resume the stack; if it normalised here,
+        # a FastV run whose prune layer is the last layer would normalise twice -- once at the
+        # end of the first call and again at the end of the resumed call -- and the logits would
+        # be silently wrong.
+        return self.norm(hidden_states) if stop_layer is None else hidden_states

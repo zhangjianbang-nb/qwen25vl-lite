@@ -31,7 +31,7 @@ import os
 import resource
 import sys
 import time
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 import torch
 
@@ -42,6 +42,9 @@ from qwen25vl_lite.engine import EngineConfig, LLMEngine, ModelRunner  # noqa: E
 from qwen25vl_lite.model import apply_quantization, build_model, load_weights  # noqa: E402
 from qwen25vl_lite.planner import format_bytes, kv_bytes_per_token, plan_memory  # noqa: E402
 from qwen25vl_lite.sampling import SamplingParams  # noqa: E402
+
+# CLI spelling -> quantisation scheme name accepted by `model.apply_quantization`.
+_SCHEMES = {"int8": "int8_per_channel", "int4": "int4_groupwise", "awq": "awq_style"}
 
 
 def free_bytes() -> int:
@@ -99,11 +102,24 @@ def check_memory(cfg: Qwen25VLConfig, dtype_name: str, quant: str, group_size: i
     return weight_bytes
 
 
-def make_prompt_ids(vocab: int, length: int) -> List[int]:
+def make_prompt_ids(vocab: int, length: int, forbidden: Optional[Sequence[int]] = None) -> List[int]:
     """Deterministic pseudo-prompt.  Benchmarks do not need meaningful text, only a
     realistic length and a stable token distribution (so prefix caching behaves the same
-    way on every run)."""
-    return [(7 * i + 11) % vocab for i in range(length)]
+    way on every run).
+
+    ``forbidden`` excludes the multimodal control tokens: the text-only benchmark has no
+    pixels, and the engine rightly refuses a prompt containing an image placeholder without
+    them.
+    """
+    skip = set(int(t) for t in (forbidden or ()))
+    out: List[int] = []
+    i = 0
+    while len(out) < length:
+        tok = (7 * i + 11) % vocab
+        if tok not in skip:
+            out.append(tok)
+        i += 1
+    return out
 
 
 def bench(args) -> dict:
@@ -135,25 +151,37 @@ def bench(args) -> dict:
     t0 = time.perf_counter()
     model = build_model(cfg)
     if args.quant != "float32":
-        apply_quantization(model, args.quant, group_size)
+        # `--quant` uses the CLI spelling (int8/int4/awq); `apply_quantization` takes the scheme
+        # name.  Mapping it here rather than passing the flag through: `--quant int4` is the
+        # documented example command, and it must not die on "unknown scheme 'int4'".
+        apply_quantization(model, _SCHEMES[args.quant], group_size)
     load_weights(args.model, model, device=device, dtype=dtype)
     model.eval()
     load_s = time.perf_counter() - t0
 
+    # Cap the pool at what this run can actually use.  The planner's number is a capacity
+    # statement -- on a small model it can be millions of tokens -- and allocating it verbatim
+    # would try to materialise that many blocks and get the process OOM-killed.
+    usable_blocks = (args.max_model_len // args.block_size + 1) * args.batch_size + 8
     ecfg = EngineConfig(
-        num_blocks=max(plan.gpu_kv_tokens // args.block_size + 8, 64),
+        num_blocks=max(min(plan.kv_pool_tokens // args.block_size + 8, usable_blocks), 64),
         block_size=args.block_size,
         max_num_seqs=args.batch_size,
         max_num_batched_tokens=args.max_num_batched_tokens,
         max_model_len=args.max_model_len,
         enable_prefix_cache=args.prefix_cache,
         vision_tier=args.tier,
+        # The engine config must agree with how the weights were loaded, or the KV cache is
+        # written at one width and read at another and every attention call fails.
+        dtype=dtype,
+        device=device,
     )
     runner = ModelRunner(model, ecfg, device=device)
     engine = LLMEngine(runner, ecfg)
 
-    vocab = cfg.text.vocab_size
-    prompt_ids = [make_prompt_ids(vocab, args.prompt_len) for _ in range(args.batch_size)]
+    vocab = cfg.text_config.vocab_size
+    forbidden = (cfg.image_token_id, cfg.vision_start_token_id, cfg.vision_end_token_id)
+    prompt_ids = [make_prompt_ids(vocab, args.prompt_len, forbidden) for _ in range(args.batch_size)]
 
     t0 = time.perf_counter()
     for ids in prompt_ids:

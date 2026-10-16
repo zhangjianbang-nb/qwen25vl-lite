@@ -134,6 +134,12 @@ class QuantizedTensor:
                 q = q.reshape(n, -1, g)
             w = (q * scale).reshape(n, k_pad)[:, :k]
 
+        if self.axis == 1:
+            # axis=1 grouped along K, so the quantiser transposed the weight first.  Undo that
+            # before anything else: without it the reconstruction comes back as [K, N] and
+            # silently disagrees with the original in both shape and values, and the AWQ
+            # rescale below would divide along the wrong axis.
+            w = w.t().contiguous()
         if self.rescale is not None:
             w = w / self.rescale.to(device=device, dtype=torch.float32).reshape(1, -1)
         return w.to(dtype)

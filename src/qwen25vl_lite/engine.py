@@ -33,9 +33,17 @@ from .config import Qwen25VLConfig
 from .model import Qwen25VLLite
 from .rope import text_position_ids
 from .sampling import SamplingParams, apply_penalties, sample_token
-from .vision_budget import TIERS, VisionTier, fastv_select
+from .vision_budget import TIERS, VisionTier, apply_fastv, fastv_select
 
 __all__ = ["EngineConfig", "RequestOutput", "ModelRunner", "LLMEngine", "EngineStats"]
+
+# Storage dtype for the KV cache.  `int8` is not a torch dtype -- it selects the quantised
+# layout, whose scales are stored at the compute dtype -- so it is handled separately.
+KV_STORAGE_DTYPES = {
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "float32": torch.float32,
+}
 
 
 @dataclass
@@ -50,7 +58,11 @@ class EngineConfig:
     enable_prefix_cache: bool = True
     enable_chunked_prefill: bool = True
     quantize_kv: bool = False
-    kv_dtype: str = "float16"
+    # KV storage dtype.  `None` means "whatever the model runs in" -- the sane default, since a
+    # cache in a different width than the compute dtype would fail on the very first attention
+    # call.  Setting it explicitly (e.g. "int8" for a quantised cache, or "float16" to halve KV
+    # on a bf16 model) is what makes it an override rather than a decorative field.
+    kv_dtype: Optional[str] = None
     vision_tier: str = "full"
     enable_fastv: bool = False
     fastv_ratio: float = 0.5
@@ -77,6 +89,19 @@ class EngineConfig:
         tier.validate()
         if not self.enable_fastv and tier.fastv_ratio > 0 and tier.fastv_layer < 1:
             raise ValueError(f"tier {tier.name!r} sets a fastv_ratio but fastv_layer < 1")
+        # `kv_dtype` is the single source of truth for how KV is stored; `quantize_kv` is the
+        # older boolean spelling of the same thing.  Both are accepted, but they are reconciled
+        # here so that setting `kv_dtype="int8"` cannot silently do nothing.
+        if self.kv_dtype == "int8":
+            self.quantize_kv = True
+        elif self.kv_dtype is not None and self.kv_dtype not in KV_STORAGE_DTYPES:
+            raise ValueError(
+                f"unknown kv_dtype {self.kv_dtype!r}; known: {sorted(KV_STORAGE_DTYPES)} + 'int8'"
+            )
+        if self.quantize_kv:
+            self.kv_dtype = "int8"
+        if self.fastv_layer < 1:
+            raise ValueError("fastv_layer must be >= 1")
 
 
 @dataclass
@@ -133,7 +158,7 @@ class ModelRunner:
             block_size=engine_cfg.block_size,
             num_kv_heads=text.num_key_value_heads,
             head_dim=text.head_dim,
-            dtype=engine_cfg.dtype,
+            dtype=KV_STORAGE_DTYPES.get(engine_cfg.kv_dtype, engine_cfg.dtype),
             device=self.device,
             quantize=engine_cfg.quantize_kv,
         )
@@ -154,6 +179,17 @@ class ModelRunner:
             )
             self.backends = report.chosen
             self.backend_report: Optional[BackendReport] = report
+
+        # FastV reads attention probabilities from layer `fastv_layer`, so that layer must exist.
+        # Without this check a request fails deep inside the forward pass with a message about
+        # missing probabilities, which points at the wrong place; here the config is rejected
+        # once, with the model depth named.
+        if self.fastv_enabled and self.fastv_layer >= text.num_hidden_layers:
+            raise ValueError(
+                f"fastv_layer={self.fastv_layer} does not exist in a {text.num_hidden_layers}-layer "
+                f"model (layers are 0..{text.num_hidden_layers - 1}); lower fastv_layer or pick a "
+                "different vision tier"
+            )
 
     # -- helpers ---------------------------------------------------------------------
     def tier(self, name: Optional[str] = None) -> VisionTier:
@@ -288,20 +324,23 @@ class ModelRunner:
         probs = captured["probs"]
 
         keep = fastv_select(probs, image_positions, self.fastv_ratio)
-        keep_mask = torch.ones(prompt_len, dtype=torch.bool)
+        # Reuse the library helper rather than a second, inlined copy of the same logic: two
+        # implementations of "which tokens survive" can drift, and only one of them would be
+        # covered by the unit tests.  `keep` holds *token positions*, so mapping them back to
+        # ordinals among the image tokens is still needed to index the vision features.
+        _, position_ids, new_ids, keep_mask = apply_fastv(
+            seq.prompt_token_ids, hidden[0], seq.prompt_position_ids, image_positions, keep
+        )
         ordinal = {pos_i: idx for idx, pos_i in enumerate(image_positions)}
-        for i in image_positions:
-            if i not in set(int(x) for x in keep):
-                keep_mask[i] = False
-
         kept_ordinals = [ordinal[i] for i in sorted(int(x) for x in keep)]
-        new_ids = [t for t, k in zip(seq.prompt_token_ids, keep_mask.tolist()) if k]
 
         seq.prompt_token_ids = new_ids
-        seq.prompt_position_ids = pos[:, :, keep_mask]
+        seq.prompt_position_ids = position_ids
         if seq.vision_features is not None:
             seq.vision_features = seq.vision_features[kept_ordinals]
             seq.image_cursor = seq.vision_features.shape[0]
+        # The image tokens that actually made it into the KV cache -- what the stat should count.
+        seq.extra["vision_tokens_prefilled"] = len(kept_ordinals)
         self._shrink_blocks(seq, len(new_ids))
 
         n_heads = self.cache.num_kv_heads
@@ -427,6 +466,7 @@ class LLMEngine:
         seq = SequenceState(
             seq_id=self._next_id,
             prompt_token_ids=ids,
+            submitted_prompt_token_ids=list(ids),
             block_size=self.ecfg.block_size,
             sampling_params=vars(sampling_params).copy(),
             priority=priority,
@@ -478,10 +518,17 @@ class LLMEngine:
         matched, blocks, node_ids = self.runner.prefix_cache.match(seq.prompt_token_ids, seq.prefix_key)
         matched = min(matched, len(seq.prompt_token_ids) - 1)  # keep >= 1 token to prefill
         matched -= matched % self.ecfg.block_size
-        if matched <= 0:
+        n_blocks = matched // self.ecfg.block_size
+        if n_blocks <= 0:
+            # `match` raised the user count on every node it walked, including the tail we are
+            # about to discard.  Releasing all of them is what keeps the counts balanced: a
+            # block-aligned prompt matched `len//block_size` nodes and we adopt one fewer, and
+            # the surplus would otherwise stay pinned forever (never evictable, never freed).
+            self.runner.prefix_cache.release(node_ids)
             return
         seq.extra["prefix_adopted"] = True
-        n_blocks = matched // self.ecfg.block_size
+        if len(node_ids) > n_blocks:
+            self.runner.prefix_cache.release(node_ids[n_blocks:])
         blocks = blocks[:n_blocks]
         node_ids = node_ids[:n_blocks]
         seq.block_table = list(blocks)
@@ -689,7 +736,11 @@ class LLMEngine:
             seq.num_computed_tokens = end
             self.runner.stats.prefill_chunks += 1
             if start == 0:
-                self.runner.stats.vision_tokens_total += seq.extra.get("n_image_tokens", 0)
+                # FastV removes image tokens, so the pre-prune count would overstate what was
+                # actually prefilled.  `vision_tokens_prefilled` is set by the FastV path.
+                self.runner.stats.vision_tokens_total += seq.extra.get(
+                    "vision_tokens_prefilled", seq.extra.get("n_image_tokens", 0)
+                )
 
             if seq.num_computed_tokens >= len(seq.prompt_token_ids):
                 seq.status = "running"
@@ -763,17 +814,28 @@ class LLMEngine:
         done.append(
             RequestOutput(
                 seq_id=seq.seq_id,
-                prompt_token_ids=list(seq.prompt_token_ids),
+                prompt_token_ids=self._reported_prompt(seq),
                 output_token_ids=list(seq.output_token_ids),
                 finish_reason="error",
                 metrics={
-                    "prompt_tokens": float(len(seq.prompt_token_ids)),
+                    "prompt_tokens": float(len(seq.submitted_prompt_token_ids or seq.prompt_token_ids)),
                     "completion_tokens": float(len(seq.output_token_ids)),
                     "elapsed_s": time.time() - seq.arrival,
                 },
                 error=message,
             )
         )
+
+    @staticmethod
+    def _reported_prompt(seq: SequenceState) -> List[int]:
+        """The prompt as the caller submitted it, not as FastV rewrote it.
+
+        ``run_prefill_fastv`` replaces ``seq.prompt_token_ids`` with the pruned sequence so the
+        rest of the engine can compute positions and blocks from it.  That is internal bookkeeping
+        and must not leak into the response: a caller that submitted 1000 tokens and got 400 back
+        cannot map the output to its input, and any prompt_tokens accounting is then wrong.
+        """
+        return list(seq.submitted_prompt_token_ids or seq.prompt_token_ids)
 
     def _accept(self, seq: SequenceState, token: int, done: List[RequestOutput]) -> None:
         params = self._params(seq)
@@ -803,12 +865,12 @@ class LLMEngine:
             done.append(
                 RequestOutput(
                     seq_id=seq.seq_id,
-                    prompt_token_ids=list(seq.prompt_token_ids),
+                    prompt_token_ids=self._reported_prompt(seq),
                     output_token_ids=list(seq.output_token_ids),
                     finish_reason=reason,
                     metrics={
                         "cached_tokens": float(seq.cached_tokens),
-                        "prompt_tokens": float(len(seq.prompt_token_ids)),
+                        "prompt_tokens": float(len(seq.submitted_prompt_token_ids or seq.prompt_token_ids)),
                         "completion_tokens": float(len(seq.output_token_ids)),
                         "ttft_s": max(0.0, self._first_token_at.get(seq.seq_id, seq.arrival) - seq.arrival),
                         "elapsed_s": time.time() - seq.arrival,

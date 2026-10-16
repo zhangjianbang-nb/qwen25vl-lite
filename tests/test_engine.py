@@ -165,9 +165,11 @@ def test_fastv_prunes_and_still_completes(tiny_model_dir, tiny_hf_config, tiny_i
     outs = engine.run_until_complete()
     assert len(outs) == 1
     seq = outs[0]
-    remaining = sum(1 for t in seq.prompt_token_ids if t == cfg.image_token_id)
-    assert remaining < n_image, (
-        f"FastV kept every image token ({remaining}/{n_image}); pruning did not happen"
+    # The response reports the submitted prompt (FastV rewrites the internal one), so pruning is
+    # observed through the statistic instead -- which is also the number FastV used to overstate.
+    prefilled = engine.stats()["vision_tokens_total"]
+    assert prefilled < n_image, (
+        f"FastV kept every image token ({prefilled}/{n_image}); pruning did not happen"
     )
     assert len(seq.output_token_ids) == 3
 
@@ -175,8 +177,9 @@ def test_fastv_prunes_and_still_completes(tiny_model_dir, tiny_hf_config, tiny_i
 def test_fastv_refuses_only_the_offending_request(tiny_model_dir):
     """FastV needs the whole prompt in one chunk and refuses otherwise -- but refusing must not
     take the engine down: the other requests still have to be served."""
+    # fastv_layer=1, because the tiny fixture has two layers and a prune layer must exist.
     engine, cfg, model_dir, hf = _stack(tiny_model_dir, enable_fastv=True, fastv_ratio=0.5,
-                                        max_num_batched_tokens=8)
+                                        fastv_layer=1, max_num_batched_tokens=8)
     engine.add_request(list(range(1, 40)), SamplingParams(temperature=0.0, max_tokens=2,
                                                           ignore_eos=True))
     engine.add_request([3, 4, 5], SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True))
@@ -279,4 +282,89 @@ def test_preemption_releases_prefix_cache_references(tiny_model_dir):
     users = [n.refcount for n in pc.nodes.values() if n.block_ids]
     assert all(r == 0 for r in users), (
         f"a preempted sequence left its cache reference behind: {users}"
+    )
+
+
+def test_block_aligned_repeated_prompt_leaves_no_pinned_cache_node(tiny_model_dir):
+    """The block-aligned case is the one that leaks.
+
+    `match` raises the user count on *every* node it walks, but a sequence keeps one token
+    back for prefill, so a prompt whose length is an exact multiple of `block_size` adopts one
+    node fewer than it matched.  The surplus node's count was raised and never lowered, which
+    pinned it (and its block) forever.  The earlier tests used 40- and 65-token prompts and so
+    never hit the boundary.
+    """
+    engine, cfg, model_dir, hf = _stack(tiny_model_dir, num_blocks=32, block_size=16,
+                                        enable_prefix_cache=True)
+    prompt = list(range(20, 84))  # 64 tokens: exactly 4 blocks
+    assert len(prompt) % 16 == 0
+    engine.add_request(prompt, SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True))
+    engine.run_until_complete()
+    for _ in range(3):  # each repeat is a full-prefix hit and the leaking path
+        engine.add_request(prompt, SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True))
+        engine.run_until_complete()
+    pc = engine.runner.prefix_cache
+    users = [n.refcount for n in pc.nodes.values() if n.block_ids]
+    assert users and all(r == 0 for r in users), (
+        f"a block-aligned repeat pinned cache nodes permanently: {users}"
+    )
+    # The cache legitimately keeps its own block reference per cached node, so the pool is not
+    # fully free.  What must not happen is *drain*: repeating the same prompt has to leave the
+    # pool exactly where it was, not one block poorer per repeat.
+    free_now = engine.runner.block_manager.num_free
+    engine.add_request(prompt, SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True))
+    engine.run_until_complete()
+    assert engine.runner.block_manager.num_free == free_now, (
+        f"repeating the prompt drained the block pool ({free_now} -> "
+        f"{engine.runner.block_manager.num_free})"
+    )
+
+
+def test_kv_dtype_selects_the_storage_layout(tiny_model_dir):
+    """`kv_dtype` used to be a field nothing read.  It is now the single source of truth:
+    `int8` turns on quantised KV, and the float names pick the storage dtype."""
+    engine, cfg, model_dir, hf = _stack(tiny_model_dir, kv_dtype="int8")
+    assert engine.runner.cache.quantize is True
+    assert engine.ecfg.quantize_kv is True
+
+    engine, cfg, model_dir, hf = _stack(tiny_model_dir, kv_dtype="float32")
+    assert engine.runner.cache.quantize is False
+    assert engine.runner.cache.k.dtype == torch.float32
+
+    with pytest.raises(ValueError, match="kv_dtype"):
+        EngineConfig(kv_dtype="int4")
+
+
+def test_fastv_layer_beyond_the_model_depth_is_rejected_at_construction(tiny_model_dir):
+    """A prune layer that does not exist used to surface as a missing-probabilities error in
+    the middle of a request.  It is a configuration error and is rejected as one."""
+    model_dir, hf = tiny_model_dir
+    cfg = Qwen25VLConfig.from_pretrained(model_dir)
+    model = build_model(cfg)
+    load_weights(model_dir, model, strict=True)
+    depth = cfg.text_config.num_hidden_layers
+    ecfg = EngineConfig(num_blocks=8, block_size=16, enable_fastv=True, fastv_ratio=0.5,
+                        fastv_layer=depth)
+    with pytest.raises(ValueError, match="does not exist"):
+        ModelRunner(model, ecfg, device="cpu")
+
+
+def test_fastv_reports_the_tokens_it_actually_prefilled(tiny_model_dir, tiny_inputs):
+    """`vision_tokens_total` counted the image tokens in the *submitted* prompt, so FastV made
+    the statistic overstate the work done.  It now counts the survivors."""
+    engine, cfg, model_dir, hf = _stack(tiny_model_dir, enable_fastv=True, fastv_ratio=0.5,
+                                        fastv_layer=1, max_num_batched_tokens=512)
+    ids = tiny_inputs["input_ids"][0].tolist()
+    n_image = sum(1 for t in ids if t == cfg.image_token_id)
+    engine.add_request(
+        ids, SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True),
+        pixel_values=tiny_inputs["pixel_values"], image_grid_thw=tiny_inputs["image_grid_thw"],
+    )
+    out = engine.run_until_complete()[0]
+    assert out.prompt_token_ids == ids, (
+        "FastV rewrote the prompt; the response must report what the caller submitted"
+    )
+    assert engine.stats()["vision_tokens_total"] < n_image, (
+        f"pruning must reduce the counted vision tokens ({engine.stats()['vision_tokens_total']}"
+        f" vs {n_image} submitted)"
     )

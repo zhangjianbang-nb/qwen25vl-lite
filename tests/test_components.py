@@ -113,6 +113,18 @@ def test_plan_keeps_three_context_numbers_separate():
     assert "GPU-resident KV pool" in text
     assert "swap capacity" in text
     assert "logical context ceiling" in text
+    # The three numbers must be three *different* quantities, not the same figure printed
+    # three times with different labels: the pool is bounded by the device, the swap capacity
+    # by host memory, and the logical ceiling by the model config.
+    gpu_tokens = plan.kv_pool_tokens
+    swap_tokens = int((96 * (1 << 30)) // plan.kv_per_token)
+    logical = cfg.text_config.max_position_embeddings
+    assert len({gpu_tokens, swap_tokens, logical}) == 3, (
+        f"the three context numbers collapsed into fewer than three values: "
+        f"gpu={gpu_tokens} swap={swap_tokens} logical={logical}"
+    )
+    assert swap_tokens > gpu_tokens, "96 GB of host memory must hold more KV than an 8 GB card"
+    assert str(logical) in text.replace(",", ""), "the logical ceiling must appear in the summary"
 
 
 def test_plan_fits_3b_int4_on_8gb_but_not_250k_tokens():
@@ -123,6 +135,23 @@ def test_plan_fits_3b_int4_on_8gb_but_not_250k_tokens():
         "the planner must not claim 250k GPU-resident tokens on an 8 GB card"
     )
     assert plan.gpu_layers == 36, "INT4 weights for 3B should fit fully on an 8 GB device"
+
+
+def test_plan_reports_only_resident_bytes_when_layers_are_offloaded():
+    """With a device too small for the weights, the plan keeps some layers resident and the
+    rest in host memory.  `gpu_bytes` must count only the resident ones -- counting the whole
+    `weights_bytes` reported a total larger than the very budget the plan was built from."""
+    cfg = _three_b_config()
+    vram = 4 * (1 << 30)
+    plan = plan_memory(cfg, vram_bytes=vram, ram_bytes=96 * (1 << 30),
+                       weight_dtype="int4", kv_dtype="float16")
+    assert plan.cpu_layers > 0, "INT4 3B weights cannot fit in 4 GB; some layers must be offloaded"
+    assert plan.gpu_weights_bytes < plan.weights_bytes
+    assert plan.gpu_weights_bytes < plan.weights_bytes, (
+        "offloaded layers must not be counted as resident"
+    )
+    assert plan.gpu_bytes <= vram * 0.90, "the reported footprint must respect the device budget"
+    assert "on GPU" in plan.summary()
 
 
 def test_int8_weights_leave_less_kv_room_than_int4():
@@ -357,9 +386,26 @@ def test_pruned_tier_actually_enables_fastv(tiny_model_dir):
     load_weights(model_dir, model, strict=True)
     model.eval()
 
-    runner = ModelRunner(model, EngineConfig(num_blocks=64, max_model_len=4096,
-                                             vision_tier="pruned"))
+    # The tiny fixture has two layers and the tier's default prune layer is 2, which does not
+    # exist there -- refused up front, with the depth named, instead of failing mid-request.
+    with pytest.raises(ValueError, match="does not exist"):
+        ModelRunner(model, EngineConfig(num_blocks=64, max_model_len=4096, vision_tier="pruned"))
+
+    # On a model deep enough for the tier's layer, the tier alone is what enables pruning: no
+    # `enable_fastv` flag is set, so the ratio must be coming from the tier.
+    import dataclasses
+
+    from qwen25vl_lite.vision_budget import TIERS
+
+    deep = dataclasses.replace(cfg, text_config=dataclasses.replace(
+        cfg.text_config, num_hidden_layers=4))
+    runner = ModelRunner(build_model(deep), EngineConfig(num_blocks=64, max_model_len=4096,
+                                                        vision_tier="pruned"))
     assert runner.fastv_enabled, "pruned tier did not enable FastV"
+    assert runner.fastv_ratio == TIERS["pruned"].fastv_ratio, (
+        "the runner must read the tier's ratio, not the unused EngineConfig default"
+    )
+    assert runner.fastv_layer == TIERS["pruned"].fastv_layer
     assert runner.fastv_ratio == pytest.approx(0.5)
 
     plain = ModelRunner(model, EngineConfig(num_blocks=64, max_model_len=4096,
@@ -717,3 +763,81 @@ def test_quant_linear_moves_buffers_with_to():
     assert ql.qscales.dtype == torch.float64, "buffers were not converted by .to()"
     assert ql.qdata.dtype == torch.int8, "the packed data must keep its integer dtype"
     assert ql.quantized().data.device == torch.device("cpu")
+
+
+def test_int4_axis_1_dequantises_back_to_the_original_layout():
+    """`axis=1` grouped along K, so the quantiser transposes first.  The dequantiser used to
+    omit the transpose back and returned a [K, N] reconstruction for an [N, K] weight -- a
+    silent shape *and* value error on a documented code path."""
+    # K=64 is a multiple of group_size, so no zero padding is involved and the only error is
+    # the INT4 rounding itself -- which is what makes the comparison meaningful.
+    w = torch.randn(32, 64)
+    qt = quantize_int4_groupwise(w, group_size=32, axis=1)
+    assert qt.axis == 1
+    rec = qt.dequantize(torch.float32)
+    assert rec.shape == w.shape, f"axis=1 dequantised to {tuple(rec.shape)}, expected {tuple(w.shape)}"
+    # INT4 over a 32-wide group of N(0,1) data: the quantisation step is roughly range/15, so a
+    # worst-case error near 0.2 is expected.  What matters is that the values land back in the
+    # right cells -- the old code returned them transposed.
+    assert (rec - w).abs().max() < 0.3, "axis=1 reconstruction lost the weight values"
+    assert (rec - w).abs().mean() < 0.1, "axis=1 reconstruction is systematically off"
+
+
+def test_block_manager_fork_rejects_bogus_block_ids():
+    """`fork` is the counterpart of `free_blocks` and must be equally strict: the lenient
+    version invented a refcount entry for an unknown id and hid the ownership bug."""
+    bm = BlockManager(4, 16)
+    blocks = bm.allocate(4)
+    bm.fork(blocks[:1])
+    assert bm.refcount[blocks[0]] == 2
+    with pytest.raises(ValueError):
+        bm.fork([99])  # out of range
+
+    fresh = BlockManager(4, 16)
+    taken = fresh.allocate(1)
+    with pytest.raises(ValueError):
+        fresh.fork([b for b in range(4) if b not in taken])  # never allocated
+
+    bm.free_blocks(blocks)       # blocks[0] held two references, so it drops to one
+    bm.free_blocks(blocks[:1])   # ... and now to zero
+    with pytest.raises(ValueError):
+        bm.fork(blocks[:1])      # already free
+
+
+def test_offload_placement_and_bookkeeping():
+    """The offload module is a library the engine does not wire up, so its own behaviour is the
+    only thing that can be tested -- and its docstring claims the scheduling logic is tested."""
+    from qwen25vl_lite.offload import OffloadReport, StaticLayerOffloader, placement_for
+
+    assert placement_for(4, 4) == [True] * 4
+    assert placement_for(4, 0) == [False] * 4
+    assert placement_for(4, 2) == [True, True, False, False]
+
+    layers = [torch.nn.Linear(4, 4) for _ in range(4)]
+    off = StaticLayerOffloader(layers, gpu_layers=2, device="cpu")
+    off.prepare()
+    assert sum(off.resident) == 2
+    assert [next(l.parameters()).device.type for l in layers] == ["cpu"] * 4
+
+    off.begin_layer(2)  # a streamed layer must be materialised
+    off.end_layer(2, compute_seconds=0.01)
+    stats = off.stats()
+    assert stats["resident_layers"] == 2.0
+    assert stats["streamed_layers"] == 2.0
+    assert stats["h2d_bytes"] > 0
+
+    report = OffloadReport(h2d_bytes=1_000_000, h2d_seconds=0.01, compute_seconds=0.004)
+    assert report.effective_bandwidth_gbps == pytest.approx(0.1, rel=1e-6)
+    assert report.overlap_ratio == pytest.approx(0.4, rel=1e-6)
+    assert "GB/s" in report.summary()
+
+
+def test_offload_report_is_a_dataclass_not_a_printer(capsys):
+    """`StaticLayerOffloader.report` is an attribute holding an `OffloadReport`; reading it must
+    not print anything -- `report.summary()` is what produces text."""
+    from qwen25vl_lite.offload import StaticLayerOffloader
+
+    off = StaticLayerOffloader([torch.nn.Linear(2, 2)], gpu_layers=1, device="cpu")
+    assert off.report.summary().startswith("offload:")
+    _ = off.report
+    assert capsys.readouterr().out == ""
