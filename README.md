@@ -272,8 +272,17 @@ python -m pytest tests/test_model_vs_hf.py -q   # the equivalence gate on its ow
 python -m pytest tests/test_chunked_prefill.py -q
 ```
 
-The suite needs `transformers >= 4.41` (developed against 5.16) for the reference model, and
-builds a tiny random-weight Qwen2.5-VL on the fly — no checkpoint download.
+The suite needs `transformers` for the reference model, and builds a tiny random-weight
+Qwen2.5-VL on the fly — no checkpoint download.
+
+Every equivalence claim was measured against **`transformers` 5.16.1**, and the `dev` extra
+pins exactly that version. A reference implementation is allowed to change its internals
+between releases, and 5.20 did: it renamed a rotary-embedding class, replaced
+`apply_multimodal_rotary_pos_emb` with a generic helper, and moved the MRoPE interleave into
+the cos/sin tables. So "matches transformers" is a claim about a version, not a moving target.
+The two tests that inspect HF internals use instantiated modules rather than private class
+names and skip with a stated reason on other versions; the end-to-end equivalence tests run
+everywhere. On 5.16.1 the suite is 101 passed; on 5.20 it is 101 passed, 2 skipped.
 
 ## License
 

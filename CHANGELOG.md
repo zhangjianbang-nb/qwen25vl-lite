@@ -84,6 +84,29 @@ not reached. All four are fixed, and each now has a test:
 Also: `RequestOutput.metrics` now carries `ttft_s`. The README advertised TTFT but the engine
 never recorded it, so the benchmark had nothing to read.
 
+### Fixed after CI (2026-10-15)
+
+The first CI run failed on both Python versions while the suite passed locally. The cause was
+an unpinned test dependency, not the engine:
+
+- `dev` required `transformers>=4.41`, so CI resolved the newest release, while the equivalence
+  tests import HF internals. `transformers` 5.20 renamed `Qwen2_5_VisionRotaryEmbedding` to
+  `Qwen2_5_VLVisionRotaryEmbedding`, dropped `apply_multimodal_rotary_pos_emb` in favour of a
+  generic `apply_rotary_pos_emb` with no `mrope_section` argument, and moved the MRoPE
+  interleave into the cos/sin tables.
+
+Two changes:
+
+- **`dev` now pins `transformers==5.16.1`**, the version every equivalence claim was actually
+  measured against. "Matches transformers" is not a claim that survives an arbitrary upgrade,
+  and a reference implementation is allowed to change its internals between releases.
+- **The two tests that inspect HF internals no longer import private class names.** They use
+  the instantiated modules (`model.visual.rotary_pos_emb`, `model.language_model.rotary_emb`),
+  and skip with an explicit reason on versions whose convention differs. The end-to-end
+  equivalence tests run on every version and pass on both 5.16.1 and 5.20.
+
+Result: `pytest tests/ -q` → 101 passed on 5.16.1; 101 passed, 2 skipped on 5.20.
+
 ### Not included
 
 - GPU-measured throughput or memory figures. The development machine has no CUDA-enabled

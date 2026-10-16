@@ -24,8 +24,13 @@ dependencies = [
 
 [project.optional-dependencies]
 # `transformers` is needed for real checkpoints (tokenizer) and for the equivalence tests.
-hf = ["transformers>=4.41", "safetensors>=0.4"]
-dev = ["pytest>=7.0", "transformers>=4.41", "safetensors>=0.4"]
+# The runtime path only needs the tokenizer, so `hf` stays loose.
+hf = ["transformers>=5.0", "safetensors>=0.4"]
+# The equivalence tests compare against `transformers`' own Qwen2.5-VL implementation, and
+# that implementation's internals move between releases (5.20 renamed a rotary-embedding class
+# and dropped `apply_multimodal_rotary_pos_emb`).  So the verified version is pinned: the
+# correctness claim is "matches transformers 5.16.1", not "matches whatever is newest".
+dev = ["pytest>=7.0", "transformers==5.16.1", "safetensors>=0.4"]
 
 [project.scripts]
 qwen25vl-lite = "qwen25vl_lite.cli:main"
