@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qwen25vl-lite"
+version = "0.1.0"
+description = "A small, verifiable Qwen2.5-VL inference engine for 8 GB consumer GPUs"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [{ name = "qwen25vl-lite contributors" }]
+keywords = ["qwen2.5-vl", "inference", "quantization", "paged-attention", "vision-language"]
+classifiers = [
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "torch>=2.1",
+  "numpy>=1.23",
+  "pillow>=9.0",
+]
+
+[project.optional-dependencies]
+# `transformers` is needed for real checkpoints (tokenizer) and for the equivalence tests.
+hf = ["transformers>=4.41", "safetensors>=0.4"]
+dev = ["pytest>=7.0", "transformers>=4.41", "safetensors>=0.4"]
+
+[project.scripts]
+qwen25vl-lite = "qwen25vl_lite.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/zhangjianbang-nb/qwen25vl-lite"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["ignore::FutureWarning"]
