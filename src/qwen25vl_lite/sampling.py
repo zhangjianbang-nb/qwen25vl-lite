@@ -101,6 +101,11 @@ def sample_token(logits: torch.Tensor, params: SamplingParams, generator: Option
         scores = torch.empty_like(scores).scatter_(0, order, filtered)
 
     probs = torch.softmax(scores, dim=-1)
+    if not torch.isfinite(probs).all() or float(probs.sum()) <= 0.0:
+        # Aggressive top_k/min_p filtering can remove every finite score, leaving softmax with
+        # all -inf inputs -> NaN probabilities -> multinomial failure.  Falling back to greedy
+        # keeps the engine running and is the least surprising behaviour.
+        return int(torch.argmax(logits).item())
     if generator is not None:
         return int(torch.multinomial(probs, 1, generator=generator).item())
     return int(torch.multinomial(probs, 1).item())

@@ -243,7 +243,7 @@ def bytes_per_weight(dtype: str, group_size: Optional[int] = None) -> float:
     """Bytes per stored weight for a weight-only quantisation scheme."""
     if dtype in ("int8", "float16", "bfloat16", "float32"):
         return DTYPE_BYTES[dtype]
-    if dtype == "int4":
+    if dtype in ("int4", "awq"):
         g = group_size or 128
         return 0.5 + 4.0 / g  # packed nibbles + fp16 scale + fp16 zero
     raise ValueError(f"unknown weight dtype {dtype!r}")

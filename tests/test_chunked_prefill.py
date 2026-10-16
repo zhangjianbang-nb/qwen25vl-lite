@@ -213,7 +213,7 @@ def test_prefix_cache_reuses_and_matches_fresh_compute(tiny_model_dir):
     runner.prefix_cache.insert(prompt, s1.block_table[: len(prompt) // 16], s1.prefix_key)
 
     s2 = make()
-    matched, blocks = runner.prefix_cache.match(prompt, s2.prefix_key)
+    matched, blocks, _nodes = runner.prefix_cache.match(prompt, s2.prefix_key)
     assert matched == len(prompt) // 16 * 16, f"expected a full-block prefix hit, got {matched}"
     runner.block_manager.fork(blocks)
     s2.block_table = list(blocks)

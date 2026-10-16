@@ -83,7 +83,7 @@ def apply_multimodal_rotary_pos_emb(
     **repeated as a list** -- ``[16, 24, 24] -> [16, 24, 24, 16, 24, 24]`` -- and the six
     slices are taken from axes ``0, 1, 2, 0, 1, 2`` in order.  Doubling each entry instead
     of repeating the list yields a different (wrong) interleaving while still producing a
-    correctly shaped tensor; ``tests/test_mrope_matches_hf.py`` pins this down.
+    correctly shaped tensor; ``tests/test_model_vs_hf.py`` pins this down.
     """
     sections: List[int] = list(int(s) for s in mrope_section) * 2
     if sum(sections) != cos.shape[-1]:

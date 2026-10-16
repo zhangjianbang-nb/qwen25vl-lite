@@ -122,18 +122,24 @@ class RadixPrefixCache:
     def _block_key(self, tokens: Sequence[int]) -> Tuple[int, ...]:
         return tuple(int(t) for t in tokens)
 
-    def match(self, tokens: Sequence[int], extra_key: str = "") -> Tuple[int, List[int]]:
-        """Longest cached prefix of ``tokens`` -> ``(matched_tokens, block_ids)``.
+    def match(self, tokens: Sequence[int], extra_key: str = "") -> Tuple[int, List[int], List[int]]:
+        """Longest cached prefix of ``tokens`` -> ``(matched_tokens, block_ids, node_ids)``.
+
+        ``node_ids`` is returned alongside the blocks because ownership must be released by
+        *node identity*, not by physical block id: after a sequence is preempted and resumed it
+        holds freshly allocated blocks, so its block table no longer names the nodes it adopted.
+        Releasing by block id would then decrement the wrong node (or none at all).
 
         ``extra_key`` (see :func:`prefix_fingerprint`) is mixed into the node key so that two
         requests with identical token ids but different pixels cannot collide.
         """
         if len(tokens) < self.block_size:
             self.misses += 1
-            return 0, []
+            return 0, [], []
         node_id = self.root
         matched_tokens = 0
         blocks: List[int] = []
+        node_ids: List[int] = []
         while matched_tokens + self.block_size <= len(tokens):
             key = self._block_key(tokens[matched_tokens : matched_tokens + self.block_size])
             if extra_key:
@@ -147,12 +153,13 @@ class RadixPrefixCache:
             matched_tokens += len(child.tokens)
             child.last_used = time.time()
             child.refcount += 1
+            node_ids.append(nxt)
             node_id = nxt
         if blocks:
             self.hits += 1
         else:
             self.misses += 1
-        return matched_tokens, blocks
+        return matched_tokens, blocks, node_ids
 
     def insert(self, tokens: Sequence[int], block_ids: Sequence[int], extra_key: str = "") -> None:
         """Register whole blocks of ``tokens`` as a cached prefix.
@@ -191,23 +198,40 @@ class RadixPrefixCache:
             pos += self.block_size
         self._evict_if_needed()
 
-    def release(self, blocks: Sequence[int]) -> None:
-        """Drop one *user* reference to the nodes owning ``blocks``.
+    def release(self, node_ids: Sequence[int]) -> None:
+        """Drop one *user* reference from each of ``node_ids``.
 
-        Ownership model, which the previous version got wrong in both directions:
+        Takes node ids, not block ids: a sequence that was preempted and resumed holds freshly
+        allocated blocks, so its block table no longer names the nodes it adopted.  Matching by
+        physical block id would decrement the wrong node, or none, and leak the adopted node.
 
-        * The cache holds exactly **one** block reference per cached node, taken via
-          ``bm.fork`` at ``insert`` time and dropped only when the node is evicted.
-        * ``node.refcount`` counts **live users** (sequences that matched this node), and
-          exists solely to decide whether a node is safe to evict.
+        Ownership model, which an earlier version got wrong in both directions:
 
-        So this method must *not* call ``bm.free_blocks``: the caller already frees its own
-        reference through ``runner.free``, and freeing again here would be a double free.
+        * The cache holds exactly **one** block reference per cached node, taken via ``bm.fork``
+          at ``insert`` time and dropped only when the node is evicted.
+        * ``node.refcount`` counts **live users** (sequences that matched this node), and exists
+          solely to decide whether a node is safe to evict.
+
+        So this method must *not* call ``bm.free_blocks``: the caller frees its own reference
+        through ``runner.free``, and freeing again here would be a double free.
         """
-        wanted = set(int(b) for b in blocks)
-        for node in self.nodes.values():
-            if node.block_ids and node.block_ids[0] in wanted and node.refcount > 0:
+        for nid in node_ids:
+            node = self.nodes.get(int(nid))
+            if node is not None and node.refcount > 0:
                 node.refcount -= 1
+
+    def _subtree_is_evictable(self, node_id: int) -> bool:
+        """True when nothing in this subtree has a live user."""
+        stack = [node_id]
+        while stack:
+            nid = stack.pop()
+            node = self.nodes.get(nid)
+            if node is None:
+                continue
+            if node.refcount > 0:
+                return False
+            stack.extend(node.children.values())
+        return True
 
     def _drop_subtree(self, node_id: int) -> None:
         """Remove a node and everything below it, dropping the cache's block references."""
@@ -221,31 +245,60 @@ class RadixPrefixCache:
             if node.block_ids:
                 self.bm.free_blocks(node.block_ids)
 
+    def _evictable(self) -> List[int]:
+        """Node ids that may be dropped, least-recently-used first."""
+        return sorted(
+            (nid for nid, n in self.nodes.items()
+             if n.parent is not None and n.refcount == 0 and self._subtree_is_evictable(nid)),
+            key=lambda nid: self.nodes[nid].last_used,
+        )
+
+    def _detach_and_drop(self, nid: int) -> None:
+        node = self.nodes.get(nid)
+        if node is None:
+            return
+        parent = self.nodes.get(node.parent) if node.parent is not None else None
+        if parent is not None:
+            for key, cid in list(parent.children.items()):
+                if cid == nid:
+                    parent.children.pop(key, None)
+        self._drop_subtree(nid)
+
+    def evict(self, count: int = 1) -> int:
+        """Force-evict up to ``count`` cached nodes; returns how many were dropped.
+
+        The engine calls this under memory pressure: cached prefixes hold block references, and
+        with a small pool those blocks are exactly what a new request needs.  Without a way to
+        give them back, the scheduler can stall with work still queued.
+        """
+        dropped = 0
+        for nid in self._evictable():
+            if dropped >= count:
+                break
+            self._detach_and_drop(nid)
+            dropped += 1
+        return dropped
+
     def _evict_if_needed(self) -> None:
         """Evict least-recently-used evictable nodes until the tree is back in budget.
 
-        The previous version popped only the victim's *children*, never removed the victim
+        An earlier version popped only the victim's *children*, never removed the victim
         itself, and never released its blocks -- so the tree grew without bound and the block
         pool drained permanently.  Both halves are fixed here.
+
+        ``max_nodes`` counts cached nodes, not the root, and a victim is only dropped when its
+        whole subtree has no live user: eviction must never free a block that a running
+        sequence is still reading.
         """
-        if len(self.nodes) <= self.max_nodes:
+        # `len(self.nodes)` includes the lazily created root, which holds no blocks.
+        cached = len(self.nodes) - (1 if self.root in self.nodes else 0)
+        if cached <= self.max_nodes:
             return
-        victims = sorted(
-            (nid for nid, n in self.nodes.items() if n.parent is not None and n.refcount == 0),
-            key=lambda nid: self.nodes[nid].last_used,
-        )
-        for nid in victims:
-            if len(self.nodes) <= self.max_nodes:
+        for nid in self._evictable():
+            cached = len(self.nodes) - (1 if self.root in self.nodes else 0)
+            if cached <= self.max_nodes:
                 break
-            node = self.nodes.get(nid)
-            if node is None:
-                continue
-            parent = self.nodes.get(node.parent) if node.parent is not None else None
-            if parent is not None:
-                for key, cid in list(parent.children.items()):
-                    if cid == nid:
-                        parent.children.pop(key, None)
-            self._drop_subtree(nid)
+            self._detach_and_drop(nid)
 
     def stats(self) -> Dict[str, float]:
         total = self.hits + self.misses
@@ -447,6 +500,7 @@ class SequenceState:
     num_computed_tokens: int = 0
     cached_tokens: int = 0  # tokens satisfied by a prefix-cache hit (independent of decode steps)
     block_table: List[int] = field(default_factory=list)
+    prefix_node_ids: List[int] = field(default_factory=list)  # cache nodes this seq adopted
     status: str = "waiting"  # waiting | running | swapped | finished
     vision_features: Optional[torch.Tensor] = None
     grid_thw: Optional[torch.Tensor] = None

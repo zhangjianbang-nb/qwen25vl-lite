@@ -23,7 +23,7 @@ qwen25vl-lite serve --model ./Qwen2.5-VL-3B-Instruct --device cuda --weight-dtyp
 
 | Claim | How it is checked | Status |
 |---|---|---|
-| MRoPE matches HF **bit for bit** | `tests/test_model_vs_hf.py::test_mrope_cos_sin_and_apply_match_hf` uses `torch.equal` (zero tolerance) | passing |
+| MRoPE matches HF **bit for bit** | `tests/test_model_vs_hf.py::test_mrope_cos_sin_and_apply_match_hf` uses `torch.equal` (zero tolerance) | passing on 5.16.1; skips on 5.20, where HF moved the interleave into the cos/sin tables |
 | Vision tower matches HF | `test_vision_tower_matches_hf`, `atol=1e-5` | passing |
 | End-to-end logits match HF (text and multimodal) | `test_full_logits_match_hf`, `test_text_only_logits_match_hf` | passing |
 | Multimodal logits match HF when windowed vision attention engages | `test_multimodal_logits_match_hf_with_windowing_engaged` (a 22x30 patch grid = 12 windows) | passing |
@@ -33,14 +33,14 @@ qwen25vl-lite serve --model ./Qwen2.5-VL-3B-Instruct --device cuda --weight-dtyp
 | Prefix-cache reuse == recomputing the prefix | `test_prefix_cache_reuses_and_matches_fresh_compute` | passing |
 | Greedy engine output == `transformers.generate` | `test_greedy_generation_matches_hf_generate` | passing |
 | Preemption keeps the block pool in budget and every request still finishes | `test_preemption_keeps_the_pool_within_budget` (+ a recompute variant), which also asserts the pool returns to empty | passing |
-| Quantiser is self-consistent (scale axis, INT4 packing, AWQ objective) | `test_quantization_error_bounds`, `test_int4_pack_unpack_roundtrip`, `test_awq_beats_plain_groupwise`, `test_symmetric_int4_preserves_negative_weights` | passing |
+| Quantiser is self-consistent (scale axis, INT4 packing, AWQ objective) | `test_quantisation_error_bounds`, `test_int4_pack_unpack_roundtrip`, `test_awq_style_beats_plain_groupwise_when_channels_differ`, `test_symmetric_int4_preserves_negative_weights` | passing |
 | The prefix cache evicts and returns blocks instead of leaking | `test_prefix_cache_eviction_actually_evicts_and_returns_blocks` | passing |
 | The block pool rejects unknown and double frees | `test_block_manager_rejects_bogus_frees` | passing |
 | Sampling penalties and validation actually apply | `test_engine_applies_sampling_penalties`, `test_engine_rejects_invalid_and_unsupported_sampling_params` | passing |
 
 ```
 $ python -m pytest tests/
-111 passed in 6.18s
+116 passed in ~7s
 ```
 
 Everything runs on CPU with tiny random weights and **no model download**, so the suite is
@@ -179,14 +179,18 @@ it. Tiers are listed in increasing order of risk:
 | `thumbnail` | ceiling reduced to 256 | 0.190 | fine detail and OCR degrade noticeably |
 | `pruned` | full resolution, then FastV drops the 50% lowest-attention image tokens after layer 2 | 1.00 (drops *after* encoding) | task-dependent; validate with `scripts/quality_gate.py` |
 
-The ratios are the ones `scripts/quality_gate.py --gate C` prints on a 900x1200 image; they
-are a property of the ceilings, not of any particular model. `pruned` keeps all tokens
-through the tower and prunes inside the language model, so its *prompt* is unchanged until
-pruning and its ratio is reported as 1.00 at the vision-token stage.
+The ratios are the ones `scripts/quality_gate.py --gate C --tiers full,half,thumbnail` prints on
+a 900x1200 image; they are a property of the ceilings, not of any particular model. `pruned`
+keeps all tokens through the tower and prunes inside the language model, so its *prompt* is
+unchanged until pruning and its ratio is 1.00 at the vision-token stage — which is why Gate C's
+default tier list does not include it, and why the `1.00` above is stated rather than measured
+there. Pass `--tiers full,pruned` to compare it directly.
 
-**Resolution is the only lever wired into a tier.** It is also the honest one: fewer vision
-tokens is exactly what prefill time and KV pressure are made of, and it needs no change to
-the checkpoint's feature geometry.
+Two levers are wired into tiers: a **resolution ceiling** (`full` / `half` / `thumbnail`) and
+**FastV pruning** (`pruned`). Resolution is the honest default: fewer vision tokens is exactly
+what prefill time and KV pressure are made of, and it needs no change to the checkpoint's
+feature geometry. FastV is the riskier one, which is why it is a separate tier rather than a
+flag applied to the others.
 
 `pool_merge` (2x2 grid-preserving average pool) and `tome_merge` (bipartite soft matching)
 are implemented and unit-tested, but they are **not** wired into any tier, and the README
@@ -281,7 +285,7 @@ Stated plainly, because the alternative is a user discovering them:
 
 ```bash
 pip install -e ".[dev]"              # pytest + the pinned transformers
-python -m pytest tests/              # 111 tests, CPU-only, no downloads
+python -m pytest tests/              # 116 tests, CPU-only, no downloads
 python -m pytest tests/test_model_vs_hf.py    # the equivalence gate on its own
 python -m pytest tests/test_chunked_prefill.py
 ```
@@ -296,7 +300,7 @@ between releases, and 5.20 did: it renamed a rotary-embedding class, replaced
 the cos/sin tables. So "matches transformers" is a claim about a version, not a moving target.
 The two tests that inspect HF internals use instantiated modules rather than private class
 names and skip with a stated reason on other versions; the end-to-end equivalence tests run
-everywhere. On the pinned 5.16.1 the suite is 111 passed; under 5.20 it is 111 passed,
+everywhere. On the pinned 5.16.1 the suite is 116 passed; under 5.20 it is 116 passed,
 2 skipped. That second number was produced by running the suite in a scratch virtualenv with
 `pip install -U transformers`; it is not reproducible from the pinned `dev` extra by design,
 because the pin exists to keep CI on the verified version.

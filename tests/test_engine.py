@@ -172,13 +172,21 @@ def test_fastv_prunes_and_still_completes(tiny_model_dir, tiny_hf_config, tiny_i
     assert len(seq.output_token_ids) == 3
 
 
-def test_fastv_refuses_a_prompt_that_does_not_fit_one_chunk(tiny_model_dir):
+def test_fastv_refuses_only_the_offending_request(tiny_model_dir):
+    """FastV needs the whole prompt in one chunk and refuses otherwise -- but refusing must not
+    take the engine down: the other requests still have to be served."""
     engine, cfg, model_dir, hf = _stack(tiny_model_dir, enable_fastv=True, fastv_ratio=0.5,
                                         max_num_batched_tokens=8)
     engine.add_request(list(range(1, 40)), SamplingParams(temperature=0.0, max_tokens=2,
                                                           ignore_eos=True))
-    with pytest.raises(ValueError):
-        engine.run_until_complete()
+    engine.add_request([3, 4, 5], SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True))
+    outs = engine.run_until_complete()
+    by_id = {o.seq_id: o for o in outs}
+    assert len(outs) == 2, "the engine must finish every request, including the refused one"
+    assert by_id[0].finish_reason == "error", "the over-long FastV request must be refused"
+    assert by_id[0].error and "chunk" in by_id[0].error
+    assert by_id[1].finish_reason != "error", "the short request must still be served"
+    assert len(by_id[1].output_token_ids) == 2
 
 
 def test_long_prompt_is_chunked_not_rejected(tiny_model_dir):
@@ -245,4 +253,30 @@ def test_prefix_cache_references_are_released_when_a_request_finishes(tiny_model
     users = [n.refcount for n in pc.nodes.values() if n.block_ids]
     assert users and all(r == 0 for r in users), (
         f"cached nodes still report live users after every request finished: {users}"
+    )
+
+
+def test_preemption_releases_prefix_cache_references(tiny_model_dir):
+    """Preempting a sequence must drop its cache user reference.  Preemption is easy to forget
+    and leaks the node permanently, because `match` is the only thing that raises the count."""
+    # 8 blocks of 16 = 128 tokens: one 65-token request fits, two at once do not, so the
+    # scheduler must preempt.  The cached prefix holds blocks too, which is what exercises the
+    # cache-eviction path under pressure.
+    engine, cfg, model_dir, hf = _stack(tiny_model_dir, num_blocks=8, max_num_seqs=2,
+                                        enable_prefix_cache=True)
+    # First request populates the cache; the rest reuse and then get preempted.
+    engine.add_request(list(range(20, 84)), SamplingParams(temperature=0.0, max_tokens=3,
+                                                           ignore_eos=True))
+    first = engine.run_until_complete()
+    assert len(first) == 1
+    for i in range(3):
+        engine.add_request(list(range(20, 84)) + [50 + i],
+                           SamplingParams(temperature=0.0, max_tokens=6, ignore_eos=True))
+    outs = engine.run_until_complete()
+    # `run_until_complete` returns everything finished so far, including the warm-up request.
+    assert len(outs) == len(first) + 3, "every request must complete despite preemption"
+    pc = engine.runner.prefix_cache
+    users = [n.refcount for n in pc.nodes.values() if n.block_ids]
+    assert all(r == 0 for r in users), (
+        f"a preempted sequence left its cache reference behind: {users}"
     )

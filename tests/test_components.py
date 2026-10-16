@@ -230,9 +230,9 @@ def test_prefix_cache_match_and_insert():
     pc = RadixPrefixCache(bm)
     blocks = bm.allocate(3)
     pc.insert(list(range(12)), blocks, "key")
-    matched, got = pc.match(list(range(12)) + [99], "key")
+    matched, got, _nodes = pc.match(list(range(12)) + [99], "key")
     assert matched == 12 and list(got) == list(blocks)
-    matched2, got2 = pc.match(list(range(12)), "other-key")
+    matched2, got2, _nodes2 = pc.match(list(range(12)), "other-key")
     assert matched2 == 0 and got2 == [], "a different fingerprint must not reuse the prefix"
 
 
@@ -318,10 +318,9 @@ def test_quant_linear_matches_manual_dequantisation():
     assert torch.allclose(ql(x), ref, atol=1e-6)
 
 
-def test_quant_linear_moves_buffers_with_to():
-    ql = QuantLinear.from_float(torch.nn.Linear(8, 4), "int8_per_channel")
-    ql = ql.to(torch.float64) if False else ql
-    assert ql.quantized().data.device == torch.device("cpu")
+# (the `.to()` behaviour of QuantLinear is covered further down, in
+#  test_quant_linear_moves_buffers_with_to -- the stale tautological copy that used to sit here
+#  was removed rather than left shadowed)
 
 
 # ---------------------------------------------------------------------------------------
@@ -656,18 +655,19 @@ def test_prefix_cache_eviction_actually_evicts_and_returns_blocks():
     """_evict_if_needed popped only the victim's children, never the victim, and never released
     its blocks, so the tree grew without bound and drained the block pool.
 
-    Ownership is modelled the way the engine does it: a sequence allocates blocks, registers
-    them, finishes (``release`` drops its user count), then frees its own reference.  The cache
-    keeps one reference of its own, and that is what eviction must drop.
+    Ownership is modelled the way the engine does it: a sequence allocates blocks and registers
+    them, then frees its own reference.  Registering does not make the donor a user, so its node
+    is immediately evictable; the cache keeps one reference of its own, and that is what
+    eviction must drop.
     """
     bm = BlockManager(64, 4)
     pc = RadixPrefixCache(bm, max_nodes=3)
     for i in range(6):
         blocks = bm.allocate(1)
         pc.insert(list(range(i * 4, i * 4 + 4)), blocks, f"k{i}")
-        pc.release(blocks)      # the inserting sequence finished
-        bm.free_blocks(blocks)  # ... and dropped its own reference
-    assert len(pc.nodes) <= 3 + 1, f"cache grew past its node budget: {len(pc.nodes)} nodes"
+        bm.free_blocks(blocks)  # the donating sequence dropped its own reference
+    cached = len(pc.nodes) - (1 if pc.root in pc.nodes else 0)
+    assert cached <= 3, f"cache grew past its node budget: {cached} cached nodes"
     assert bm.in_use() <= 3, (
         f"evicted nodes never released the cache's block references: {bm.in_use()} blocks "
         f"still held"
@@ -683,9 +683,9 @@ def test_prefix_cache_release_makes_a_node_evictable():
     pc.insert(list(range(4)), blocks, "k")
     node = next(n for n in pc.nodes.values() if n.block_ids)
     assert node.refcount == 0, "registering a prefix must not make the donor a user"
-    pc.match(list(range(4)) + [9], "k")
+    _matched, _blocks, nodes = pc.match(list(range(4)) + [9], "k")
     assert node.refcount == 1, "a match must mark the node in use"
-    pc.release(blocks)
+    pc.release(nodes)
     assert node.refcount == 0, "release did not decrement the user count"
 
 
@@ -695,23 +695,25 @@ def test_top_p_keeps_the_token_that_crosses_the_threshold():
     logits = torch.tensor([4.0, 3.0, 2.0, 1.0, 0.0])
     params = SamplingParams(temperature=1.0, top_p=0.5, max_tokens=1)
     probs = torch.softmax(logits, dim=-1)
-    # Reproduce the filter and check the surviving mass.
     sorted_probs, order = torch.sort(probs, descending=True)
     cumulative = torch.cumsum(sorted_probs, dim=-1)
     crossing = int((cumulative >= 0.5).nonzero()[0])
-    kept_mass = float(cumulative[crossing])
-    assert kept_mass >= 0.5, "the crossing token must be kept for the mass to reach top_p"
-    # And the sampled token must always come from the kept prefix.
+    assert float(cumulative[crossing]) >= 0.5, "the crossing token must be kept"
+    # Every sampled token must be one of the kept ids (a set-membership check on token ids,
+    # not a float comparison of probabilities).
+    kept_ids = {int(i) for i in order[: crossing + 1].tolist()}
     gen = torch.Generator().manual_seed(0)
-    for _ in range(20):
-        tok = sample_token(logits, params, gen)
-        assert int((probs[order][: crossing + 1] == probs[tok]).nonzero()[0]) <= crossing
+    for _ in range(50):
+        assert sample_token(logits, params, gen) in kept_ids
 
 
 def test_quant_linear_moves_buffers_with_to():
-    """The previous version wrote `ql.to(...) if False else ql`, which never called .to() --
+    """The earlier version wrote `ql.to(...) if False else ql`, so `.to()` was never called and
     the test asserted only that a freshly built CPU module is on CPU."""
     ql = QuantLinear.from_float(torch.nn.Linear(8, 4), "int8_per_channel")
+    assert ql.qscales.dtype == torch.float32
     moved = ql.to(torch.float64)
-    assert moved is not ql or moved.qdata.dtype == ql.qdata.dtype
+    assert moved is ql, "nn.Module.to() returns self in place"
+    assert ql.qscales.dtype == torch.float64, "buffers were not converted by .to()"
+    assert ql.qdata.dtype == torch.int8, "the packed data must keep its integer dtype"
     assert ql.quantized().data.device == torch.device("cpu")

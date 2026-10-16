@@ -19,8 +19,10 @@ The package is deliberately layered so each stage can be verified on its own:
 ``server``         OpenAI-compatible HTTP API
 ``cli``            command line entry points
 
-Nothing here imports ``transformers`` at runtime: it is only used by the test suite, to
-check that this engine reproduces the reference implementation numerically.
+The engine core does not import ``transformers``: the config is parsed from
+``config.json`` directly.  ``transformers`` appears in two places only -- the test suite,
+where it is the reference implementation this engine is checked against numerically, and the
+serving layer, which uses its tokenizer.  Everything the engine itself needs is pure torch.
 """
 
 from __future__ import annotations

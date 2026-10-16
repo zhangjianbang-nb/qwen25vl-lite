@@ -5,7 +5,7 @@
 ``qwen25vl-lite tiers``    list the vision-token strategies
 ``qwen25vl-lite bench``    run a short benchmark against a model directory
 ``qwen25vl-lite serve``    start the OpenAI-compatible server
-``qwen25vl-lite generate`` one-shot generation from a prompt
+``qwen25vl-lite generate`` one-shot generation from prompt token ids
 
 Run as ``python -m qwen25vl_lite.cli ...`` or via the ``qwen25vl-lite`` console script.
 """
@@ -227,7 +227,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--device", default="cpu")
     p.add_argument("--vram-gb", type=float, default=None)
     p.add_argument("--ram-gb", type=float, default=None)
-    p.add_argument("--weight-dtype", default="int4")
+    p.add_argument("--weight-dtype", default="int4",
+                   choices=["float32", "float16", "bfloat16", "int8", "int4", "awq"])
     p.add_argument("--group-size", type=int, default=128)
     p.add_argument("--kv-dtype", default="float16", choices=["float16", "bfloat16", "float32", "int8"])
     p.add_argument("--vision-tier", default="full", choices=sorted(TIERS))

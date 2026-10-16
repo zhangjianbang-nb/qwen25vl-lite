@@ -28,7 +28,7 @@ GPU-measured performance numbers ship with it (see "Not included" below).
   pooling; ToME-style bipartite merging with explicit position ids; FastV-style pruning in the
   language model after the vision tower. Each *tier* applies exactly one lever (a resolution
   ceiling, or FastV); pooling and ToME are library utilities that no tier uses, and the README
-  says so — see "Fixed after the gates were run".
+  says so — see "Vision reduction: one lever per tier" there.
 - **Memory planner**: computes KV cost per token from the config and reports logical context,
   GPU-resident KV and CPU swap capacity as three separate numbers.
 - **Offload**: static CPU/GPU layer placement with double-buffered prefetch and an
@@ -41,7 +41,7 @@ GPU-measured performance numbers ship with it (see "Not included" below).
   machine's reclaimable memory.
 - **Quality gates** (`scripts/quality_gate.py`): Gate A against `transformers`, Gate B per
   quantisation scheme, Gate C per vision tier. Runnable without a real checkpoint (`--tiny`).
-- **Tests**: 111 tests, CPU-only, no checkpoint download. Includes a 20-combination chunked
+- **Tests**: 116 tests, CPU-only, no checkpoint download. Includes a 20-combination chunked
   prefill equivalence matrix, step-by-step paged-decode parity with HF, batched-vs-sequential
   decode parity, prefix-cache reuse parity, greedy generation parity with
   `transformers.generate`, and a multimodal case with a large enough image to engage windowed
@@ -105,7 +105,7 @@ Two changes:
   and skip with an explicit reason on versions whose convention differs. The end-to-end
   equivalence tests run on every version and pass on both 5.16.1 and 5.20.
 
-Result: `pytest tests/` → 111 passed on 5.16.1; 111 passed, 2 skipped on 5.20. (Note that
+Result: `pytest tests/` → 116 passed on 5.16.1; 116 passed, 2 skipped on 5.20. (Note that
 `pyproject.toml` already sets `addopts = "-q"`, so adding `-q` again suppresses the summary
 line — the counts above come from `pytest tests/`.)
 

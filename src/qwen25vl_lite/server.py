@@ -334,7 +334,10 @@ def make_handler(service: EngineService):
                 self._sse_start()
                 emitted = 0
                 first = True
+                last_reason = None
                 for update in stream:
+                    if update.finish_reason:
+                        last_reason = update.finish_reason
                     text = _apply_stops(self.service_ref.decode(update.output_token_ids), stops)
                     chunk = text[emitted:]
                     emitted = len(text)
@@ -376,17 +379,19 @@ def make_handler(service: EngineService):
                             "choices": [{"index": 0, "text": chunk,
                                          "finish_reason": update.finish_reason or None}],
                         })
-                # The terminal event must carry the same object type as the stream it ends:
-                # a `/v1/completions` stream reporting `chat.completion.chunk` here was an
-                # inconsistency clients could reasonably trip over.
+                # The terminal event must carry the same object type as the stream it ends
+                # (a `/v1/completions` stream reporting `chat.completion.chunk` here was an
+                # inconsistency clients could reasonably trip over) and the *true* finish
+                # reason: hard-coding "stop" reported "length" and then contradicted itself.
+                reason = last_reason or "stop"
                 if chat:
                     self._sse({"id": completion_id, "object": "chat.completion.chunk", "created": created,
                                "model": self.service_ref.model_name,
-                               "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
+                               "choices": [{"index": 0, "delta": {}, "finish_reason": reason}]})
                 else:
                     self._sse({"id": completion_id, "object": "text_completion", "created": created,
                                "model": self.service_ref.model_name,
-                               "choices": [{"index": 0, "text": "", "finish_reason": "stop"}]})
+                               "choices": [{"index": 0, "text": "", "finish_reason": reason}]})
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
                 return

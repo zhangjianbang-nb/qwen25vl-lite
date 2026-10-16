@@ -167,10 +167,15 @@ def plan_memory(
         kv_pool_tokens = int(remaining // kv_per_token)
 
     total_layers = cfg.text_config.num_hidden_layers
-    per_layer_bytes = (text_quantised * bytes_w + text_float * 2.0) / max(total_layers, 1)
+    # Per-layer cost must be derived from the same quantity that produced `weights_bytes`, or
+    # the two numbers do not reconcile: `weights_bytes` is the quantised text weights plus the
+    # float text weights plus the whole vision tower.
+    per_layer_bytes = weights_bytes / max(total_layers, 1)
 
     if weights_bytes > usable - activation_reserve - reserve:
-        # Not everything fits: keep whole layers resident and stream the rest.
+        # Not everything fits: keep whole layers resident and stream the rest.  The KV pool was
+        # sized from `remaining`, which already had the weights subtracted, so it must be added
+        # back before deciding how many layers fit.
         head_room = max(usable - activation_reserve - reserve - kv_pool_tokens * kv_per_token, 0.0)
         gpu_layers = int(min(total_layers, head_room // per_layer_bytes))
         notes.append(
@@ -188,7 +193,12 @@ def plan_memory(
         per_seq = 2048
         max_num_seqs = max(1, min(64, kv_pool_tokens // per_seq)) if kv_pool_tokens else 1
 
-    max_num_batched_tokens = max(512, min(max_vision_tokens + 2048, kv_pool_tokens or 512))
+    # A prefill chunk must fit in the KV pool, so the floor cannot exceed it: a chunk larger
+    # than the pool would demand more blocks than exist and churn through preemption.
+    max_num_batched_tokens = min(
+        max(512, max_vision_tokens + 2048),
+        kv_pool_tokens if kv_pool_tokens else 512,
+    )
 
     if target_context is not None:
         needed = target_context * kv_per_token

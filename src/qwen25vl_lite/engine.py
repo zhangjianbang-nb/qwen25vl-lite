@@ -88,6 +88,7 @@ class RequestOutput:
     output_token_ids: List[int]
     finish_reason: str
     metrics: Dict[str, float] = field(default_factory=dict)
+    error: Optional[str] = None
 
     @property
     def num_prompt_tokens(self) -> int:
@@ -467,26 +468,40 @@ class LLMEngine:
 
         Idempotent: pass 2 of the scheduler can re-enter this for the same sequence after a
         preemption retry, and adopting twice would fork the blocks twice and double-count the
-        hit statistics.
+        hit statistics.  The flag is only set on an actual hit, so a sequence that missed once
+        is still allowed to adopt later.
         """
         if not self.ecfg.enable_prefix_cache:
             return
         if seq.extra.get("prefix_adopted"):
             return
-        seq.extra["prefix_adopted"] = True
-        matched, blocks = self.runner.prefix_cache.match(seq.prompt_token_ids, seq.prefix_key)
+        matched, blocks, node_ids = self.runner.prefix_cache.match(seq.prompt_token_ids, seq.prefix_key)
         matched = min(matched, len(seq.prompt_token_ids) - 1)  # keep >= 1 token to prefill
         matched -= matched % self.ecfg.block_size
         if matched <= 0:
             return
-        blocks = blocks[: matched // self.ecfg.block_size]
+        seq.extra["prefix_adopted"] = True
+        n_blocks = matched // self.ecfg.block_size
+        blocks = blocks[:n_blocks]
+        node_ids = node_ids[:n_blocks]
         seq.block_table = list(blocks)
+        seq.prefix_node_ids = list(node_ids)
         self.runner.block_manager.fork(blocks)
         seq.cached_tokens = matched
         seq.num_computed_tokens = matched
         seq.image_cursor = sum(1 for t in seq.prompt_token_ids[:matched] if t == self.runner.cfg.image_token_id)
         self.runner.stats.prefix_cache_hits += 1
         self.runner.stats.prefix_cache_tokens_saved += matched
+
+    def _release_prefix(self, seq: SequenceState) -> None:
+        """Drop this sequence's user references on the cache nodes it adopted.
+
+        Called on both completion and preemption.  Preemption is easy to forget and leaks the
+        node permanently, because ``match`` raised the count and nothing else lowers it.
+        """
+        if seq.prefix_node_ids:
+            self.runner.prefix_cache.release(seq.prefix_node_ids)
+            seq.prefix_node_ids = []
 
     def _register_prefix(self, seq: SequenceState) -> None:
         if not self.ecfg.enable_prefix_cache:
@@ -530,9 +545,9 @@ class LLMEngine:
             try:
                 self.runner.ensure_blocks(seq, seq.num_computed_tokens + chunk)
             except MemoryError:
-                if not self._preempt_one():
-                    return ready, budget
-                continue
+                if self._free_something():
+                    continue
+                return ready, budget
             seq.extra["chunk"] = chunk
             ready.append(seq)
             budget -= chunk
@@ -540,6 +555,10 @@ class LLMEngine:
         # Pass 2: admit new requests while there is room and budget.
         while self.waiting and len(self.running) < self.ecfg.max_num_seqs and budget > 0:
             seq = self.waiting[0]
+            # Adopt first: it lowers `num_computed_tokens`, and the chunk must be computed from
+            # the post-adoption value or `ensure_blocks` would allocate for work that is already
+            # in the cache.
+            self._adopt_prefix(seq)
             remaining = len(seq.prompt_token_ids) - seq.num_computed_tokens
             if remaining <= 0:
                 self.waiting.pop(0)
@@ -552,15 +571,10 @@ class LLMEngine:
             else:
                 break
 
-            # Adopt after the `remaining <= 0` check: adopting sets `num_computed_tokens`, and
-            # doing it before the check would make a fully-cached prompt look like it still has
-            # work to do.  `_adopt_prefix` is idempotent, so the retry below is safe.
-            self._adopt_prefix(seq)
-
             try:
                 self.runner.ensure_blocks(seq, seq.num_computed_tokens + chunk)
             except MemoryError:
-                if not self._preempt_one():
+                if not self._free_something():
                     break
                 continue
 
@@ -572,6 +586,18 @@ class LLMEngine:
 
         return ready, budget
 
+    def _free_something(self) -> bool:
+        """Make room in the block pool, and say whether anything was freed.
+
+        Two sources of held blocks: running sequences (preemption) and cached prefixes.  A
+        prefix cache holds a block reference for every cached node, so with a small pool those
+        cached blocks are exactly what a new request needs -- preempting alone cannot free them,
+        and without this second source the scheduler stalls with work still queued.
+        """
+        if self._preempt_one():
+            return True
+        return self.runner.prefix_cache.evict(1) > 0
+
     def _preempt_one(self) -> bool:
         """Free blocks by evicting the least valuable running sequence."""
         if not self.running:
@@ -580,6 +606,11 @@ class LLMEngine:
         victim = min(self.running, key=lambda s: (s.priority, -s.arrival))
         self.running.remove(victim)
         self.runner.stats.preemptions += 1
+        # Preemption abandons this sequence's claim on the cached prefix either way: in swap mode
+        # it is re-materialised into fresh blocks, and in recompute mode it re-prefills.  Not
+        # releasing here pins the cache node forever, because `match` is the only thing that
+        # raises the count and nothing else lowers it.
+        self._release_prefix(victim)
         if self.ecfg.preemption == "swap":
             victim.swap_payload = self.runner.cache.swap_out(victim.block_table)
             victim.status = "swapped"
@@ -589,6 +620,7 @@ class LLMEngine:
             victim.num_computed_tokens = 0
             victim.cached_tokens = 0
             victim.image_cursor = 0
+            victim.extra.pop("prefix_adopted", None)  # allow a fresh adoption after re-prefill
             victim.status = "waiting"
             self.waiting.insert(0, victim)
         self.runner.free(victim)
@@ -605,6 +637,11 @@ class LLMEngine:
             try:
                 seq.block_table = self.runner.block_manager.allocate(n_blocks)
             except MemoryError:
+                # Nothing running can be preempted here (we are already resuming), so the only
+                # remaining source of blocks is the prefix cache.  Without trying it, a swapped
+                # sequence whose blocks are pinned by cached prefixes can never come back.
+                if self.runner.prefix_cache.evict(1):
+                    continue
                 return
             self.runner.cache.swap_in(seq.block_table, payload)
             seq.swap_payload = None
@@ -632,13 +669,21 @@ class LLMEngine:
                 continue
             try:
                 if self.runner.fastv_enabled and start == 0:
-                    logits = self.runner.run_prefill_fastv(seq)
+                    try:
+                        logits = self.runner.run_prefill_fastv(seq)
+                    except ValueError as exc:
+                        # FastV needs the whole prompt in one chunk.  The request is refused
+                        # rather than silently served without pruning -- but refusing must not
+                        # take the whole engine down with it, so only this sequence fails and
+                        # every other request keeps being served.
+                        self._fail(seq, str(exc), done)
+                        continue
                     end = len(seq.prompt_token_ids)
                 else:
                     logits = self.runner.run_prefill_chunk(seq, start, end)
             except MemoryError:
-                # The pool shrank between scheduling and execution; preempt and retry later.
-                if self._preempt_one():
+                # The pool shrank between scheduling and execution; free and retry later.
+                if self._free_something():
                     continue
                 raise
             seq.num_computed_tokens = end
@@ -699,6 +744,37 @@ class LLMEngine:
         gen.manual_seed(int(seed) + len(seq.output_token_ids))
         return gen
 
+    def _fail(self, seq: SequenceState, message: str, done: List[RequestOutput]) -> None:
+        """Fail one request without disturbing the rest of the engine.
+
+        Used when a request cannot be served as configured (for example FastV needs the whole
+        prompt in a single chunk).  The sequence is finished with ``finish_reason="error"`` and
+        the reason is carried on the output, so a caller can tell a refused request from a
+        silently un-pruned one.
+        """
+        seq.status = "finished"
+        seq.finish_reason = "error"
+        self._release_prefix(seq)
+        self.runner.free(seq)
+        if seq in self.running:
+            self.running.remove(seq)
+        if seq in self.waiting:
+            self.waiting.remove(seq)
+        done.append(
+            RequestOutput(
+                seq_id=seq.seq_id,
+                prompt_token_ids=list(seq.prompt_token_ids),
+                output_token_ids=list(seq.output_token_ids),
+                finish_reason="error",
+                metrics={
+                    "prompt_tokens": float(len(seq.prompt_token_ids)),
+                    "completion_tokens": float(len(seq.output_token_ids)),
+                    "elapsed_s": time.time() - seq.arrival,
+                },
+                error=message,
+            )
+        )
+
     def _accept(self, seq: SequenceState, token: int, done: List[RequestOutput]) -> None:
         params = self._params(seq)
         seq.output_token_ids.append(int(token))
@@ -717,12 +793,10 @@ class LLMEngine:
         if reason:
             seq.status = "finished"
             seq.finish_reason = reason
-            # Drop this sequence's *user* reference on any cached prefix blocks before the
-            # block table is cleared.  Without this the cache's user counts only ever grew, so
-            # no node was ever evictable and every cached block was held forever.
-            if seq.cached_tokens:
-                n_blocks = seq.cached_tokens // self.ecfg.block_size
-                self.runner.prefix_cache.release(seq.block_table[:n_blocks])
+            # Drop this sequence's *user* references on the cached nodes it adopted.  Without
+            # this the cache's user counts only ever grew, so no node was ever evictable and
+            # every cached block was held forever.
+            self._release_prefix(seq)
             self.runner.free(seq)
             if seq in self.running:
                 self.running.remove(seq)
@@ -773,7 +847,9 @@ class LLMEngine:
                 last_progress = marker
         if self.has_work():
             raise RuntimeError(f"engine did not finish within {max_steps} steps")
-        return self.finished
+        # A copy, not `self.finished`: returning the live list means a caller's reference grows
+        # underneath it on the next call.
+        return list(self.finished)
 
     def _progress_marker(self) -> tuple:
         return (
