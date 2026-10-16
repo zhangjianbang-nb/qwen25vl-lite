@@ -141,7 +141,8 @@ Hence three gates (`scripts/quality_gate.py`):
   reference path first. A fused kernel that is subtly wrong produces plausible output, and
   this repository has no GPU on which to verify one.
 * **Prefix-cache eviction beyond LRU-over-nodes.** The radix tree evicts least-recently-used
-  leaves when it exceeds `max_nodes`; anything smarter needs workload data.
+  *subtrees* when it exceeds `max_nodes` (any node whose whole subtree has no live user is
+  eligible, not only leaves); anything smarter needs workload data.
 * **Speculative decoding, CUDA graphs, tensor parallelism.** Out of scope for one 8 GB card.
 
 ## Test strategy

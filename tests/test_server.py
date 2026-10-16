@@ -105,10 +105,20 @@ def test_non_streaming_response_is_a_single_json_object():
     assert payload["choices"][0]["finish_reason"] == "stop"
 
 
-def test_completions_always_returns_token_ids():
+def test_completions_returns_token_ids_in_both_modes():
     """With no tokenizer `text` is an empty string, so the endpoint would be useless without the
-    token ids.  They are an extension field and are present either way."""
+    token ids.  They are an extension field and are present in the JSON response *and* in every
+    streaming chunk -- the streaming path used to omit them, which made the README's "always"
+    untrue."""
     rec = _run([_Update([1, 2, 3], finish_reason="stop")], chat=False, body={"stream": False})
     choice = rec.json[0]["choices"][0]
     assert choice["token_ids"] == [1, 2, 3]
     assert choice["text"] == "ABC"  # the fake service has a decoder; the field is still there
+
+    rec = _run([_Update([1]), _Update([1, 2], finish_reason="stop")], chat=False,
+               body={"stream": True})
+    carried = [f["choices"][0] for f in rec.frames if f["choices"][0].get("text")]
+    assert carried and all(c.get("token_ids") for c in carried), (
+        "a streaming text_completion chunk omitted token_ids"
+    )
+    assert rec.frames[-1]["choices"][0]["token_ids"] == [1, 2]

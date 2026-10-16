@@ -350,9 +350,12 @@ def attention_with_probs(
     scores = torch.matmul(q.float(), kk.float().transpose(-2, -1)) * scale
     if attn_mask is not None:
         scores = scores + attn_mask
-    elif scores.shape[-1] > scores.shape[-2]:
-        # Causal with an offset: query i (absolute position query_offset + i) may attend to
-        # keys 0..query_offset+i.
+    else:
+        # A decoder is causal, so the default must be a causal mask.  The earlier version masked
+        # only when `k > q` (the decode/chunk case) and left a dense full-sequence pass unmasked
+        # -- which is exactly the shape FastV's first stage runs in (q_len == k_len), so the
+        # importances it measured and the hidden states it forwarded came from bidirectional
+        # attention: a silent numerical bug, not an approximation.
         n, ctx = scores.shape[-2], scores.shape[-1]
         idx = torch.arange(n, device=q.device).view(-1, 1) + query_offset
         allowed = torch.arange(ctx, device=q.device).view(1, -1) <= idx

@@ -13,7 +13,8 @@ Honest limits, stated up front because they are easy to hide:
   number that tells you which regime you are in;
 * nothing here is exercised on a CUDA device in CI (the test runner is CPU-only), so the
   scheduling logic is unit-tested while the transfer numbers must be measured on the target
-  machine.  :meth:`StaticLayerOffloader.report` prints exactly those numbers.
+  machine.  ``StaticLayerOffloader.report`` *holds* those numbers (it is an ``OffloadReport``
+  dataclass); ``report.summary()`` is what turns them into text.
 """
 
 from __future__ import annotations

@@ -136,6 +136,18 @@ class RadixPrefixCache:
     def _block_key(self, tokens: Sequence[int]) -> Tuple[int, ...]:
         return tuple(int(t) for t in tokens)
 
+    @staticmethod
+    def _extra_digest(extra_key: str) -> int:
+        """Stable 64-bit digest of the vision fingerprint.
+
+        Not `hash(extra_key)`: Python's string hash is salted per process (PYTHONHASHSEED) and
+        only its low 32 bits were kept, so the same key produced different block keys across
+        runs and two different keys could collide -- a cache that reuses KV computed for a
+        different image.  blake2b is deterministic and wide enough that collisions are not a
+        practical concern.
+        """
+        return int.from_bytes(hashlib.blake2b(extra_key.encode("utf-8"), digest_size=8).digest(), "little")
+
     def match(self, tokens: Sequence[int], extra_key: str = "") -> Tuple[int, List[int], List[int]]:
         """Longest cached prefix of ``tokens`` -> ``(matched_tokens, block_ids, node_ids)``.
 
@@ -157,7 +169,7 @@ class RadixPrefixCache:
         while matched_tokens + self.block_size <= len(tokens):
             key = self._block_key(tokens[matched_tokens : matched_tokens + self.block_size])
             if extra_key:
-                key = (hash(extra_key) & 0xFFFFFFFF,) + key
+                key = (self._extra_digest(extra_key),) + key
             node = self.nodes.get(node_id)
             nxt = node.children.get(key) if node else None
             if nxt is None:
@@ -192,7 +204,7 @@ class RadixPrefixCache:
         pos = 0
         for i in range(n_blocks):
             chunk = self._block_key(tokens[pos : pos + self.block_size])
-            key = (hash(extra_key) & 0xFFFFFFFF,) + chunk if extra_key else chunk
+            key = (self._extra_digest(extra_key),) + chunk if extra_key else chunk
             node = self.nodes.get(node_id)
             if node is None:
                 self.nodes[node_id] = _RadixNode(tokens=(), block_ids=(), parent=None)
@@ -459,8 +471,9 @@ class PagedKVCache:
 
         A utility for block-table remapping, and deliberately unused: preemption goes through
         ``swap_out``/``swap_in`` because a swapped sequence is restored into freshly allocated
-        blocks rather than the ones it had, so there is nothing to copy in place.  Kept (and
-        unit-tested) because a future shared-prefix scheme would need exactly this primitive.
+        blocks rather than the ones it had, so there is nothing to copy in place.  Kept because
+        a future shared-prefix scheme would need exactly this primitive, and covered by
+        ``tests/test_components.py::test_copy_blocks_duplicates_kv_and_scales`` so it cannot rot.
         """
         src = torch.tensor(list(src_blocks), device=self.device, dtype=torch.long)
         dst = torch.tensor(list(dst_blocks), device=self.device, dtype=torch.long)

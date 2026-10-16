@@ -152,6 +152,18 @@ class ModelRunner:
         self.device = device or engine_cfg.device
 
         text = self.cfg.text_config
+        if engine_cfg.kv_dtype not in (None, "int8"):
+            storage = KV_STORAGE_DTYPES[engine_cfg.kv_dtype]
+            if storage != engine_cfg.dtype:
+                # torch's attention kernels require query/key/value in one dtype, and the cache
+                # is written at the storage width.  A narrower cache would need an explicit cast
+                # on every read, which is not implemented -- so this is refused rather than
+                # surfacing later as "Expected query, key, and value to have the same dtype".
+                raise ValueError(
+                    f"kv_dtype={engine_cfg.kv_dtype!r} stores KV at {storage}, but the model runs at "
+                    f"{engine_cfg.dtype}; KV storage must match the compute dtype (use 'int8' for a "
+                    "quantised cache, whose scales are stored at the compute dtype)"
+                )
         self.cache = PagedKVCache(
             num_layers=text.num_hidden_layers,
             num_blocks=engine_cfg.num_blocks,
@@ -341,6 +353,10 @@ class ModelRunner:
             seq.image_cursor = seq.vision_features.shape[0]
         # The image tokens that actually made it into the KV cache -- what the stat should count.
         seq.extra["vision_tokens_prefilled"] = len(kept_ordinals)
+        # rope_delta is `max(position) + 1 - seq_len`, and pruning changes both terms.  Leaving
+        # the old value made the first decode step's position fall back behind the prompt's own
+        # positions, so every generated token was rotated wrongly.
+        seq.rope_delta = int(seq.prompt_position_ids.max().item()) + 1 - len(new_ids)
         self._shrink_blocks(seq, len(new_ids))
 
         n_heads = self.cache.num_kv_heads
@@ -492,6 +508,10 @@ class LLMEngine:
         seq.prompt_position_ids = pos
         seq.rope_delta = int(delta[0, 0].item())
         seq.extra["n_image_tokens"] = n_image_tokens
+        # FastV rewrites the prompt, so a pruned request's token ids no longer match what the
+        # prefix cache would be asked to look up (and what it would store).  Marking it here
+        # keeps both directions out of the cache rather than letting them silently never match.
+        seq.extra["fastv_will_prune"] = bool(self.runner.fastv_enabled and n_image_tokens)
 
         seq.prefix_key = prefix_fingerprint(
             ids,
@@ -512,6 +532,8 @@ class LLMEngine:
         is still allowed to adopt later.
         """
         if not self.ecfg.enable_prefix_cache:
+            return
+        if seq.extra.get("fastv_will_prune"):
             return
         if seq.extra.get("prefix_adopted"):
             return
@@ -539,6 +561,11 @@ class LLMEngine:
         seq.image_cursor = sum(1 for t in seq.prompt_token_ids[:matched] if t == self.runner.cfg.image_token_id)
         self.runner.stats.prefix_cache_hits += 1
         self.runner.stats.prefix_cache_tokens_saved += matched
+        # The vision tokens in the reused prefix were served from cache rather than recomputed;
+        # counting them keeps the statistic comparable across cache hits and misses.
+        self.runner.stats.vision_tokens_total += sum(
+            1 for t in seq.prompt_token_ids[:matched] if t == self.runner.cfg.image_token_id
+        )
 
     def _release_prefix(self, seq: SequenceState) -> None:
         """Drop this sequence's user references on the cache nodes it adopted.
@@ -552,6 +579,8 @@ class LLMEngine:
 
     def _register_prefix(self, seq: SequenceState) -> None:
         if not self.ecfg.enable_prefix_cache:
+            return
+        if seq.extra.get("fastv_will_prune"):
             return
         n_blocks = len(seq.prompt_token_ids) // self.ecfg.block_size
         if n_blocks <= 0:
@@ -616,7 +645,14 @@ class LLMEngine:
             elif remaining <= budget:
                 chunk = remaining
             else:
-                break
+                # Without chunked prefill a prompt larger than the per-step budget can never be
+                # scheduled.  Breaking here left the request queued forever and surfaced as the
+                # stall guard's "no progress" error; name the real problem instead.
+                raise ValueError(
+                    f"prompt of {remaining} tokens exceeds max_num_batched_tokens="
+                    f"{self.ecfg.max_num_batched_tokens} and chunked prefill is disabled; "
+                    "enable chunked prefill or raise max_num_batched_tokens"
+                )
 
             try:
                 self.runner.ensure_blocks(seq, seq.num_computed_tokens + chunk)
@@ -871,6 +907,9 @@ class LLMEngine:
                     metrics={
                         "cached_tokens": float(seq.cached_tokens),
                         "prompt_tokens": float(len(seq.submitted_prompt_token_ids or seq.prompt_token_ids)),
+                        # What the model actually saw, which FastV can make smaller than the
+                        # submitted prompt.  Reported so the two numbers cannot be confused.
+                        "prompt_tokens_prefilled": float(len(seq.prompt_token_ids)),
                         "completion_tokens": float(len(seq.output_token_ids)),
                         "ttft_s": max(0.0, self._first_token_at.get(seq.seq_id, seq.arrival) - seq.arrival),
                         "elapsed_s": time.time() - seq.arrival,
@@ -890,6 +929,7 @@ class LLMEngine:
         consecutive steps, the engine raises instead of spinning forever.  Silent spinning is
         the failure mode that looks like "the server is just slow".
         """
+        start = len(self.finished)
         steps = 0
         stall = 0
         last_progress = self._progress_marker()
@@ -909,9 +949,9 @@ class LLMEngine:
                 last_progress = marker
         if self.has_work():
             raise RuntimeError(f"engine did not finish within {max_steps} steps")
-        # A copy, not `self.finished`: returning the live list means a caller's reference grows
-        # underneath it on the next call.
-        return list(self.finished)
+        # Only what finished during *this* call.  `self.finished` accumulates across calls, so
+        # returning it wholesale meant a second call re-reported the first call's requests.
+        return list(self.finished[start:])
 
     def _progress_marker(self) -> tuple:
         return (

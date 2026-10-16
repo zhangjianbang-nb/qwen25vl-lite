@@ -337,7 +337,9 @@ def make_handler(service: EngineService):
                 emitted = 0
                 first = True
                 last_reason = None
+                last_ids: List[int] = []
                 for update in stream:
+                    last_ids = list(update.output_token_ids)
                     if update.finish_reason:
                         last_reason = update.finish_reason
                     text = _apply_stops(self.service_ref.decode(update.output_token_ids), stops)
@@ -360,7 +362,8 @@ def make_handler(service: EngineService):
                                 self._sse({
                                     "id": completion_id, "object": "text_completion",
                                     "created": created, "model": self.service_ref.model_name,
-                                    "choices": [{"index": 0, "text": chunk, "finish_reason": "stop"}],
+                                    "choices": [{"index": 0, "text": chunk, "finish_reason": "stop",
+                                                 "token_ids": list(update.output_token_ids)}],
                                 })
                         break
                     if not chunk:
@@ -379,7 +382,11 @@ def make_handler(service: EngineService):
                             "id": completion_id, "object": "text_completion", "created": created,
                             "model": self.service_ref.model_name,
                             "choices": [{"index": 0, "text": chunk,
-                                         "finish_reason": update.finish_reason or None}],
+                                         "finish_reason": update.finish_reason or None,
+                                         # Same extension field as the non-streaming path: with
+                                         # no tokenizer `text` is empty, and the ids are then the
+                                         # only usable payload.
+                                         "token_ids": list(update.output_token_ids)}],
                         })
                 # The terminal event must carry the same object type as the stream it ends
                 # (a `/v1/completions` stream reporting `chat.completion.chunk` here was an
@@ -393,7 +400,8 @@ def make_handler(service: EngineService):
                 else:
                     self._sse({"id": completion_id, "object": "text_completion", "created": created,
                                "model": self.service_ref.model_name,
-                               "choices": [{"index": 0, "text": "", "finish_reason": reason}]})
+                               "choices": [{"index": 0, "text": "", "finish_reason": reason,
+                                            "token_ids": list(last_ids)}]})
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
                 return

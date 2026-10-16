@@ -13,6 +13,7 @@ import torch
 from qwen25vl_lite.config import Qwen25VLConfig
 from qwen25vl_lite.engine import EngineConfig, LLMEngine, ModelRunner
 from qwen25vl_lite.model import build_model, load_weights
+from qwen25vl_lite.rope import text_position_ids
 from qwen25vl_lite.sampling import SamplingParams
 
 
@@ -276,8 +277,10 @@ def test_preemption_releases_prefix_cache_references(tiny_model_dir):
         engine.add_request(list(range(20, 84)) + [50 + i],
                            SamplingParams(temperature=0.0, max_tokens=6, ignore_eos=True))
     outs = engine.run_until_complete()
-    # `run_until_complete` returns everything finished so far, including the warm-up request.
-    assert len(outs) == len(first) + 3, "every request must complete despite preemption"
+    # `run_until_complete` returns only what finished during that call, so the warm-up request
+    # is not repeated here.
+    assert len(first) == 1
+    assert len(outs) == 3, "every request must complete despite preemption"
     pc = engine.runner.prefix_cache
     users = [n.refcount for n in pc.nodes.values() if n.block_ids]
     assert all(r == 0 for r in users), (
@@ -368,3 +371,85 @@ def test_fastv_reports_the_tokens_it_actually_prefilled(tiny_model_dir, tiny_inp
         f"pruning must reduce the counted vision tokens ({engine.stats()['vision_tokens_total']}"
         f" vs {n_image} submitted)"
     )
+
+
+def test_fastv_recomputes_rope_delta_for_the_pruned_prompt(tiny_model_dir, tiny_inputs):
+    """Pruning shortens the prompt, and `rope_delta` is derived from its positions.  Leaving the
+    old value made the first decode position fall *behind* the prompt's own positions, so every
+    generated token was rotated wrongly."""
+    engine, cfg, model_dir, hf = _stack(tiny_model_dir, enable_fastv=True, fastv_ratio=0.5,
+                                        fastv_layer=1, max_num_batched_tokens=512)
+    ids = tiny_inputs["input_ids"][0].tolist()
+    engine.add_request(ids, SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True),
+                       pixel_values=tiny_inputs["pixel_values"],
+                       image_grid_thw=tiny_inputs["image_grid_thw"])
+    engine.step()
+    seq = engine.running[0]
+    assert len(seq.prompt_token_ids) < len(ids), "the fixture must actually prune"
+    expected = int(seq.prompt_position_ids.max().item()) + 1 - len(seq.prompt_token_ids)
+    assert seq.rope_delta == expected, (
+        f"rope_delta={seq.rope_delta} was not recomputed after pruning (expected {expected})"
+    )
+    # The token generated right after the prompt must continue from the kept tokens' positions.
+    pos = text_position_ids(1, len(seq.prompt_token_ids), seq.rope_delta, "cpu")
+    assert int(pos.max()) == int(seq.prompt_position_ids.max()) + 1, (
+        f"the first decoded token got position {int(pos.max())}, but the prompt ends at "
+        f"{int(seq.prompt_position_ids.max())}"
+    )
+
+
+def test_fastv_requests_stay_out_of_the_prefix_cache(tiny_model_dir, tiny_inputs):
+    """A pruned request's tokens no longer match what the cache would be asked to look up, so
+    registering or adopting it would silently never hit -- and adopting it would skip pruning
+    entirely, making the same prompt produce different output depending on cache state."""
+    engine, cfg, model_dir, hf = _stack(tiny_model_dir, enable_fastv=True, fastv_ratio=0.5,
+                                        fastv_layer=1, max_num_batched_tokens=512,
+                                        enable_prefix_cache=True)
+    ids = tiny_inputs["input_ids"][0].tolist()
+    outs = []
+    for _ in range(2):
+        engine.add_request(ids, SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True),
+                           pixel_values=tiny_inputs["pixel_values"],
+                           image_grid_thw=tiny_inputs["image_grid_thw"])
+        outs.append(engine.run_until_complete()[0])
+    assert outs[0].output_token_ids == outs[1].output_token_ids, (
+        "the same FastV request produced different output on the second run"
+    )
+    assert engine.stats()["prefix_cache_hits"] == 0, (
+        "a pruned request must not register or adopt a prefix; a hit means it was served unpruned"
+    )
+
+
+def test_disabling_chunked_prefill_with_a_long_prompt_fails_loudly(tiny_model_dir):
+    """A prompt that cannot fit one step used to leave the request queued forever and surface as
+    the stall guard's 'no progress'; the real problem is the configuration."""
+    engine, cfg, model_dir, hf = _stack(tiny_model_dir, enable_chunked_prefill=False,
+                                        max_num_batched_tokens=8)
+    engine.add_request(list(range(1, 40)), SamplingParams(temperature=0.0, max_tokens=2,
+                                                          ignore_eos=True))
+    with pytest.raises(ValueError, match="chunked prefill is disabled"):
+        engine.run_until_complete()
+
+
+def test_run_until_complete_reports_only_this_call(tiny_model_dir):
+    """`self.finished` accumulates, so returning it wholesale re-reported earlier requests."""
+    engine, cfg, model_dir, hf = _stack(tiny_model_dir)
+    engine.add_request(list(range(3, 20)), SamplingParams(temperature=0.0, max_tokens=2,
+                                                          ignore_eos=True))
+    assert len(engine.run_until_complete()) == 1
+    engine.add_request(list(range(30, 47)), SamplingParams(temperature=0.0, max_tokens=2,
+                                                           ignore_eos=True))
+    assert len(engine.run_until_complete()) == 1, "the earlier request was reported twice"
+
+
+def test_kv_storage_dtype_must_match_the_compute_dtype(tiny_model_dir):
+    """torch's attention kernels need q/k/v in one dtype.  A narrower cache would need an
+    explicit cast that does not exist, so the mismatch is refused up front instead of failing
+    inside the first forward pass."""
+    model_dir, hf = tiny_model_dir
+    cfg = Qwen25VLConfig.from_pretrained(model_dir)
+    model = build_model(cfg)
+    load_weights(model_dir, model, strict=True)
+    ecfg = EngineConfig(num_blocks=8, block_size=16, kv_dtype="float16", dtype=torch.float32)
+    with pytest.raises(ValueError, match="KV storage must match"):
+        ModelRunner(model, ecfg, device="cpu")

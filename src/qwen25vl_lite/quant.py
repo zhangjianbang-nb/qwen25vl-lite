@@ -110,7 +110,9 @@ class QuantizedTensor:
     def dequantize(self, dtype: torch.dtype = torch.float32, device=None) -> torch.Tensor:
         """Reconstruct the dense weight.  Always the reference path for correctness."""
         device = device or self.data.device
-        n, k = int(self.shape[0]), int(self.shape[1])
+        # `shape` is the caller's [N, K]; the quantised arrays live in the working layout, which
+        # is transposed when axis=1.
+        n, k = self.meta.get("quantised_shape", (int(self.shape[0]), int(self.shape[1])))
 
         if self.bits == 8:
             q = self.data.to(device=device, dtype=torch.float32)
@@ -192,6 +194,7 @@ def quantize_int4_groupwise(
     if group_size <= 0:
         raise ValueError("group_size must be positive")
     w = weight.detach().to(torch.float32)
+    original_shape = tuple(w.shape)
     if axis == 1:
         w = w.t().contiguous()
     n, k = w.shape
@@ -225,12 +228,14 @@ def quantize_int4_groupwise(
         data=packed.contiguous(),
         scales=scale.to(torch.float16).contiguous(),
         zeros=zero.to(torch.float16).contiguous(),
-        shape=(n, k),
+        # The *original* shape, not the transposed working shape: `out_features`/`in_features`
+        # are read straight off it, so storing the transposed dims would report them swapped.
+        shape=original_shape,
         bits=4,
         group_size=g,
         axis=axis,
         scheme="int4_groupwise_sym" if symmetric else "int4_groupwise",
-        meta={"padded_in_features": k_pad},
+        meta={"padded_in_features": k_pad, "quantised_shape": (n, k)},
     )
     if rescale is not None:
         qt.rescale = rescale.detach().to(torch.float16).contiguous()

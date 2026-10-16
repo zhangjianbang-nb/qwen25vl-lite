@@ -41,7 +41,7 @@ GPU-measured performance numbers ship with it (see "Not included" below).
   machine's reclaimable memory.
 - **Quality gates** (`scripts/quality_gate.py`): Gate A against `transformers`, Gate B per
   quantisation scheme, Gate C per vision tier. Runnable without a real checkpoint (`--tiny`).
-- **Tests**: 125 tests, CPU-only, no checkpoint download. Includes a 20-combination chunked
+- **Tests**: 135 tests, CPU-only, no checkpoint download. Includes a 20-combination chunked
   prefill equivalence matrix, step-by-step paged-decode parity with HF, batched-vs-sequential
   decode parity, prefix-cache reuse parity, greedy generation parity with
   `transformers.generate`, and a multimodal case with a large enough image to engage windowed
@@ -105,7 +105,7 @@ Two changes:
   and skip with an explicit reason on versions whose convention differs. The end-to-end
   equivalence tests run on every version and pass on both 5.16.1 and 5.20.
 
-Result: `pytest tests/` → 125 passed on 5.16.1; 125 passed, 2 skipped on 5.20. (Note that
+Result: `pytest tests/` → 135 passed on 5.16.1; under 5.20 it is 133 passed and 2 skipped (135 collected). (Note that
 `pyproject.toml` already sets `addopts = "-q"`, so adding `-q` again suppresses the summary
 line — the counts above come from `pytest tests/`.)
 
@@ -184,7 +184,7 @@ the release bar, and every substantive finding is fixed here with a regression t
 - The server's streaming `/v1/completions` emitted a terminal event typed
   `chat.completion.chunk`; it now matches the stream's `text_completion`.
 
-### Fixed after the third validation round (2026-10-16)
+### Fixed after the third validation round (2026-10-15)
 
 Two independent reviewers were run against the published tree; both had to name at least ten
 defects. What they found, and what changed:
@@ -219,7 +219,7 @@ defects. What they found, and what changed:
 - **`bench/run_bench.py --quant int4` crashed.** The flag value was passed straight to
   `apply_quantization`, which expects a scheme name; the documented example command died on
   "unknown scheme 'int4'". The mapping now lives in `_SCHEMES`. Running the script end to end
-  (rather than reading it) surfaced three more defects on the same path: it read
+  (rather than reading it) surfaced four more defects on the same path: it read
   `plan.gpu_kv_tokens` and `cfg.text`, neither of which exists; it allocated the planner's whole
   *capacity* figure as blocks, which on a small model is millions of blocks and gets the process
   OOM-killed; it built the engine without the dtype the weights were loaded at, so every
@@ -252,6 +252,45 @@ defects. What they found, and what changed:
 - `offload` gained the tests its docstring claimed, `vision_budget.apply_fastv` is now the single
   pruning implementation (the engine had a second, untested copy), and FastV's own regression
   test observes pruning through the statistic instead of the rewritten prompt.
+
+### Fixed after the fourth validation round (2026-10-15)
+
+The re-scoring pass (70/100 and 77/100) confirmed the previous fixes but found more, including
+two defects in FastV itself that the earlier rounds had not touched:
+
+- **FastV's dense pass was not causal.** `attention_with_probs` applied a causal mask only when
+  `k > q`; the FastV stage runs a dense full-sequence pass (`q_len == k_len`) with no explicit
+  mask, so it attended to future tokens — the importances it measured and the hidden states it
+  forwarded were both wrong. A decoder is causal by default now, and a test compares it against
+  SDPA's causal path.
+- **FastV did not recompute `rope_delta` after pruning.** It is `max(position) + 1 - seq_len`,
+  and pruning changes both terms; the stale value made the first decoded token fall *behind* the
+  prompt's own positions, corrupting every generated token's rotation.
+- **FastV and the prefix cache disagreed about what the key described.** The cache key was built
+  from the submitted prompt but the node stored the pruned sequence, so a FastV request could
+  never hit — and if it had adopted a prefix, it would have skipped pruning entirely, making the
+  same prompt produce different output depending on cache state. FastV requests now stay out of
+  the prefix cache, and that is stated rather than left implicit.
+- **A prompt too long for one step with chunked prefill disabled deadlocked** (the stall guard
+  reported "no progress"). It is now refused with the real reason named.
+- **`run_until_complete` re-reported earlier requests**, because `self.finished` accumulates.
+- **The prefix fingerprint used `hash(str) & 0xFFFFFFFF`** — salted per process and only 32 bits,
+  so keys differed across runs and could collide, reusing KV computed for a different image. It
+  is a blake2b digest now.
+- **`QuantizedTensor.shape` held the transposed dims for `axis=1`**, so `out_features` and
+  `in_features` were swapped even though `dequantize` was right.
+- **The planner understated an int8 KV cache** by omitting the per-(token, kv_head) fp16 scales.
+- **`kv_dtype` naming a different float width than the compute dtype** was accepted and then
+  failed inside the first attention call; it is refused at construction, with the reason.
+- **Streaming `/v1/completions` chunks omitted `token_ids`**, so the README's "always" was false
+  and a client without a tokenizer got nothing in streaming mode.
+- Documentation that still overstated the code: `offload`'s docstring said `report` prints (it is
+  a dataclass), `attention.py` said the backend is written to logs (nothing is logged), README
+  said PCIe overlap is probed at runtime (only the SDPA backend is; the offload class is never
+  instantiated), README's serve example passed `--kv-dtype float16` with the default float32
+  compute dtype (which cannot work), and `design.md` described cache eviction as leaf-only (it
+  evicts any subtree with no live user).
+- The test count in the previous entry was itself wrong; the suite is 135 tests.
 
 ### Not included
 

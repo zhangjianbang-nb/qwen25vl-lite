@@ -20,6 +20,7 @@ import pytest
 import torch
 
 from qwen25vl_lite.attention import (
+    attention_with_probs,
     build_chunk_mask,
     build_decode_mask,
     gather_paged_kv,
@@ -841,3 +842,61 @@ def test_offload_report_is_a_dataclass_not_a_printer(capsys):
     assert off.report.summary().startswith("offload:")
     _ = off.report
     assert capsys.readouterr().out == ""
+
+
+def test_attention_with_probs_is_causal_by_default():
+    """FastV's first stage runs a dense full-sequence pass (q_len == k_len) with no explicit
+    mask.  The old code only applied a causal mask when `k > q`, so that pass ran with
+    bidirectional attention -- wrong importances and wrong hidden states, silently."""
+    torch.manual_seed(0)
+    q = torch.randn(1, 2, 6, 8)
+    k = torch.randn(1, 2, 6, 8)
+    v = torch.randn(1, 2, 6, 8)
+
+    out, probs = attention_with_probs(q, k, v)
+    ref = sdpa(q, k, v, attn_mask=None, is_causal=True)
+
+    # Nothing above the diagonal may receive attention mass.
+    upper = torch.triu(probs[0, 0].float(), diagonal=1)
+    assert float(upper.max()) < 1e-6, f"future tokens received attention: {float(upper.sum()):.3f}"
+    assert torch.allclose(out, ref, atol=1e-5), "causal default does not match SDPA's causal path"
+
+
+def test_copy_blocks_duplicates_kv_and_scales():
+    """`copy_blocks` has no caller today, so nothing else would notice if it rotted."""
+    cache = PagedKVCache(num_layers=1, num_blocks=4, block_size=4, num_kv_heads=2, head_dim=4,
+                         dtype=torch.float32, device="cpu", quantize=False)
+    kk = torch.arange(4 * 2 * 4, dtype=torch.float32).reshape(4, 2, 4)
+    vv = kk + 100.0
+    cache.write(0, kk, vv, torch.arange(4))  # slots 0..3 == block 0
+    cache.copy_blocks([0], [1])
+    src = cache.k[0].reshape(cache.num_blocks, cache.block_size, cache.num_kv_heads, cache.head_dim)
+    assert torch.equal(src[1], src[0]), "copied block does not match its source"
+    vsrc = cache.v[0].reshape(cache.num_blocks, cache.block_size, cache.num_kv_heads, cache.head_dim)
+    assert torch.equal(vsrc[1], vsrc[0])
+
+
+def test_int8_kv_cost_includes_the_per_token_scales():
+    """A quantised cache stores an fp16 scale per (token, kv_head) for K and for V; counting
+    only the 1-byte payload understated how much KV an int8 cache occupies."""
+    cfg = _three_b_config()
+    fp16 = kv_bytes_per_token(cfg, "float16")
+    int8 = kv_bytes_per_token(cfg, "int8")
+    expected_extra = 2.0 * cfg.text_config.num_key_value_heads * 2.0
+    assert int8.extra_per_token == expected_extra
+    assert int8.per_token == pytest.approx(
+        2.0 * cfg.text_config.num_hidden_layers * cfg.text_config.num_key_value_heads
+        * cfg.text_config.head_dim * 1.0 + expected_extra
+    )
+    assert int8.per_token > fp16.per_token / 2.0, "scales are a measurable share of an int8 cache"
+    assert "scales" in int8.describe()
+
+
+def test_int4_axis_1_reports_features_in_the_original_orientation():
+    """`shape` must describe the caller's [N, K] weight, not the transposed working layout, or
+    `out_features`/`in_features` come back swapped."""
+    w = torch.randn(32, 64)
+    qt = quantize_int4_groupwise(w, group_size=32, axis=1)
+    assert tuple(qt.shape) == (32, 64)
+    assert qt.out_features == 32
+    assert qt.in_features == 64

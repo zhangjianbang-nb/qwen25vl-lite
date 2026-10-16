@@ -13,8 +13,9 @@ with sane throughput — and a test suite that checks those pieces against Huggi
 pip install -e ".[hf]"            # torch + transformers (the server needs the tokenizer)
 pip install -e ".[dev]"           # ... plus pytest and the pinned transformers the tests expect
 qwen25vl-lite plan --model ./Qwen2.5-VL-3B-Instruct --vram-gb 8 --ram-gb 96 --weight-dtype int4
-qwen25vl-lite serve --model ./Qwen2.5-VL-3B-Instruct --device cuda --weight-dtype int4 \
-                    --kv-dtype float16 --num-blocks 4000
+# serve keeps KV at --dtype; add --kv-dtype int8 for a quantised cache
+qwen25vl-lite serve --model ./Qwen2.5-VL-3B-Instruct --device cuda --dtype float16 \
+                    --weight-dtype int4 --num-blocks 4000
 ```
 
 ---
@@ -40,7 +41,7 @@ qwen25vl-lite serve --model ./Qwen2.5-VL-3B-Instruct --device cuda --weight-dtyp
 
 ```
 $ python -m pytest tests/
-125 passed in ~8s
+135 passed in ~10s
 ```
 
 Everything runs on CPU with tiny random weights and **no model download**, so the suite is
@@ -64,8 +65,10 @@ Being explicit here is part of the design, not a disclaimer bolted on at the end
   dequantisation into a kernel *before* the reference path was proven, because a wrong fused
   kernel produces plausible-looking output. A fused kernel is the obvious next step, and it
   should land with a self-check against the reference path.
-* **The CPU fallback is the tested path.** CUDA-specific behaviour (which SDPA backend is
-  selected, PCIe transfer overlap) is *probed at runtime* and reported, never assumed.
+* **The CPU fallback is the tested path.** The SDPA backend actually in use is *probed at
+  runtime* (and surfaced on `/health`), never assumed. PCIe transfer overlap is **not** probed:
+  `offload.StaticLayerOffloader` measures it, but the engine never instantiates that class, so
+  nothing in a runnable path reports it.
 * **FastV-style pruning is off by default and is approximate.** See the section below.
 
 ## The three context numbers
@@ -285,9 +288,9 @@ Stated plainly, because the alternative is a user discovering them:
   plain groupwise INT4 (the code says so in a comment rather than pretending).
 * No CUDA graphs, no custom kernels, no tensor parallelism.
 * The server needs a tokenizer to produce text. `/v1/completions` accepts `prompt_token_ids`
-  and always returns the generated ids in `choices[0]["token_ids"]` (an extension field); with
-  no tokenizer the `text` field is an empty string, so a client without a tokenizer should read
-  the ids.
+  and returns the generated ids in `choices[0]["token_ids"]` (an extension field, present in
+  both the JSON response and every streaming chunk); with no tokenizer the `text` field is an
+  empty string, so a client without a tokenizer should read the ids.
 * `bench/` and the CLI can produce numbers, but this repository ships none that were measured
   on a GPU.
 
@@ -295,7 +298,7 @@ Stated plainly, because the alternative is a user discovering them:
 
 ```bash
 pip install -e ".[dev]"              # pytest + the pinned transformers
-python -m pytest tests/              # 125 tests, CPU-only, no downloads
+python -m pytest tests/              # 135 tests, CPU-only, no downloads
 python -m pytest tests/test_model_vs_hf.py    # the equivalence gate on its own
 python -m pytest tests/test_chunked_prefill.py
 ```
@@ -310,8 +313,8 @@ between releases, and 5.20 did: it renamed a rotary-embedding class, replaced
 the cos/sin tables. So "matches transformers" is a claim about a version, not a moving target.
 The two tests that inspect HF internals use instantiated modules rather than private class
 names and skip with a stated reason on other versions; the end-to-end equivalence tests run
-everywhere. On the pinned 5.16.1 the suite is 125 passed; under 5.20 it is 125 passed,
-2 skipped. That second number was produced by running the suite in a scratch virtualenv with
+everywhere. On the pinned 5.16.1 the suite is 135 passed; under 5.20 it is 133 passed and
+2 skipped (135 collected). That second number was produced by running the suite in a scratch virtualenv with
 `pip install -U transformers`; it is not reproducible from the pinned `dev` extra by design,
 because the pin exists to keep CI on the verified version.
 

@@ -36,21 +36,30 @@ class KVBytes:
     head_dim: int
     bytes_per_element: float
 
+    # Quantised KV stores a scale per (token, kv_head) for K and for V -- 4 bytes per kv_head
+    # per token on top of the 1-byte payload.  Leaving it out understated an int8 cache.
+    extra_per_token: float = 0.0
+
     @property
     def per_token(self) -> float:
-        return 2.0 * self.num_layers * self.num_kv_heads * self.head_dim * self.bytes_per_element
+        return (2.0 * self.num_layers * self.num_kv_heads * self.head_dim * self.bytes_per_element
+                + self.extra_per_token)
 
     def describe(self) -> str:
-        return (
+        base = (
             f"2 x {self.num_layers} layers x {self.num_kv_heads} kv_heads x {self.head_dim} head_dim "
-            f"x {self.bytes_per_element:g} B = {self.per_token/1024:.1f} KiB/token"
+            f"x {self.bytes_per_element:g} B"
         )
+        if self.extra_per_token:
+            base += f" + {self.extra_per_token:g} B of per-token scales"
+        return f"{base} = {self.per_token/1024:.1f} KiB/token"
 
 
 def kv_bytes_per_token(cfg: Qwen25VLConfig, kv_dtype: str = "float16") -> KVBytes:
     bytes_per = {"float16": 2.0, "bfloat16": 2.0, "float32": 4.0, "int8": 1.0}[kv_dtype]
     t = cfg.text_config
-    return KVBytes(t.num_hidden_layers, t.num_key_value_heads, t.head_dim, bytes_per)
+    extra = 2.0 * t.num_key_value_heads * 2.0 if kv_dtype == "int8" else 0.0  # fp16 scale per K/V
+    return KVBytes(t.num_hidden_layers, t.num_key_value_heads, t.head_dim, bytes_per, extra)
 
 
 def format_bytes(n: float) -> str:
