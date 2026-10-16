@@ -62,9 +62,25 @@ class BlockManager:
             self.refcount[b] = self.refcount.get(b, 0) + 1
 
     def free_blocks(self, blocks: Sequence[int]) -> None:
+        """Release one reference to each block.
+
+        Strict on purpose: an unknown id or a double free means the caller has lost track of
+        ownership, and the lenient version of this method silently pushed an out-of-range id
+        onto the free list -- which `allocate` would then hand out, producing a slot mapping
+        that writes outside the KV tensor.  Failing loudly is the only safe behaviour for a
+        memory manager.
+        """
         for b in blocks:
-            rc = self.refcount.get(b, 0) - 1
+            b = int(b)
+            if not 0 <= b < self.num_blocks:
+                raise ValueError(f"block id {b} is outside [0, {self.num_blocks})")
+            rc = self.refcount.get(b)
+            if rc is None:
+                raise ValueError(f"block {b} was never allocated")
             if rc <= 0:
+                raise ValueError(f"block {b} is already free (double free)")
+            rc -= 1
+            if rc == 0:
                 self.refcount[b] = 0
                 if b not in self.free:
                     self.free.append(b)
@@ -139,7 +155,13 @@ class RadixPrefixCache:
         return matched_tokens, blocks
 
     def insert(self, tokens: Sequence[int], block_ids: Sequence[int], extra_key: str = "") -> None:
-        """Register whole blocks of ``tokens`` as a cached prefix."""
+        """Register whole blocks of ``tokens`` as a cached prefix.
+
+        New nodes start with ``refcount == 0``: the *registering* sequence is not a user of the
+        cache, it merely donated blocks.  Only a later ``match`` makes a node in-use.  Counting
+        the registrar as a user would leave every donated node permanently un-evictable, because
+        the engine only releases adopters.
+        """
         n_blocks = len(block_ids)
         if n_blocks == 0:
             return
@@ -156,13 +178,12 @@ class RadixPrefixCache:
                 node = self.nodes[node_id]
             if key in node.children:
                 child = self.nodes[node.children[key]]
-                child.refcount += 1
                 child.last_used = time.time()
             else:
                 cid = self._next_id
                 self._next_id += 1
                 self.nodes[cid] = _RadixNode(
-                    tokens=chunk, block_ids=(block_ids[i],), parent=node_id, last_used=time.time(), refcount=1
+                    tokens=chunk, block_ids=(block_ids[i],), parent=node_id, last_used=time.time(), refcount=0
                 )
                 node.children[key] = cid
                 self.bm.fork([block_ids[i]])
@@ -171,30 +192,60 @@ class RadixPrefixCache:
         self._evict_if_needed()
 
     def release(self, blocks: Sequence[int]) -> None:
-        """Drop the references this cache holds on ``blocks`` (they may now be freed)."""
+        """Drop one *user* reference to the nodes owning ``blocks``.
+
+        Ownership model, which the previous version got wrong in both directions:
+
+        * The cache holds exactly **one** block reference per cached node, taken via
+          ``bm.fork`` at ``insert`` time and dropped only when the node is evicted.
+        * ``node.refcount`` counts **live users** (sequences that matched this node), and
+          exists solely to decide whether a node is safe to evict.
+
+        So this method must *not* call ``bm.free_blocks``: the caller already frees its own
+        reference through ``runner.free``, and freeing again here would be a double free.
+        """
         wanted = set(int(b) for b in blocks)
         for node in self.nodes.values():
-            if node.block_ids and node.block_ids[0] in wanted:
-                if node.refcount > 0:
-                    node.refcount -= 1
-                if node.refcount == 0:
-                    self.bm.free_blocks(node.block_ids)
+            if node.block_ids and node.block_ids[0] in wanted and node.refcount > 0:
+                node.refcount -= 1
+
+    def _drop_subtree(self, node_id: int) -> None:
+        """Remove a node and everything below it, dropping the cache's block references."""
+        stack = [node_id]
+        while stack:
+            nid = stack.pop()
+            node = self.nodes.pop(nid, None)
+            if node is None:
+                continue
+            stack.extend(node.children.values())
+            if node.block_ids:
+                self.bm.free_blocks(node.block_ids)
 
     def _evict_if_needed(self) -> None:
+        """Evict least-recently-used evictable nodes until the tree is back in budget.
+
+        The previous version popped only the victim's *children*, never removed the victim
+        itself, and never released its blocks -- so the tree grew without bound and the block
+        pool drained permanently.  Both halves are fixed here.
+        """
         if len(self.nodes) <= self.max_nodes:
             return
         victims = sorted(
-            (n for n in self.nodes.values() if n.parent is not None and n.refcount == 0),
-            key=lambda n: n.last_used,
+            (nid for nid, n in self.nodes.items() if n.parent is not None and n.refcount == 0),
+            key=lambda nid: self.nodes[nid].last_used,
         )
-        for node in victims[: max(1, len(self.nodes) - self.max_nodes)]:
-            for cid in list(node.children.values()):
-                self.nodes.pop(cid, None)
+        for nid in victims:
+            if len(self.nodes) <= self.max_nodes:
+                break
+            node = self.nodes.get(nid)
+            if node is None:
+                continue
             parent = self.nodes.get(node.parent) if node.parent is not None else None
             if parent is not None:
                 for key, cid in list(parent.children.items()):
-                    if cid == node.parent or self.nodes.get(cid) is node:
+                    if cid == nid:
                         parent.children.pop(key, None)
+            self._drop_subtree(nid)
 
     def stats(self) -> Dict[str, float]:
         total = self.hits + self.misses

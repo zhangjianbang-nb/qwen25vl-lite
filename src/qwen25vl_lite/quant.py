@@ -203,9 +203,12 @@ def quantize_int4_groupwise(
     w_min = groups.amin(dim=-1)
     w_max = groups.amax(dim=-1)
     if symmetric:
+        # Symmetric 4-bit uses the *signed* range -8..7, so the zero point is the constant 8
+        # and the scale is amax/7.  Using amax/15 with zero 0 would clamp every negative weight
+        # to 0 and silently discard it -- the quantiser would look fine and be wrong.
         amax = torch.maximum(w_min.abs(), w_max.abs()).clamp_min(eps)
         scale = amax / 7.0
-        zero = torch.zeros_like(scale)
+        zero = torch.full_like(scale, 8.0)
     else:
         scale = ((w_max - w_min) / 15.0).clamp_min(eps)
         zero = torch.round(-w_min / scale).clamp(0.0, 15.0)
@@ -215,7 +218,7 @@ def quantize_int4_groupwise(
     qt = QuantizedTensor(
         data=packed.contiguous(),
         scales=scale.to(torch.float16).contiguous(),
-        zeros=None if symmetric else zero.to(torch.float16).contiguous(),
+        zeros=zero.to(torch.float16).contiguous(),
         shape=(n, k),
         bits=4,
         group_size=g,
@@ -276,9 +279,13 @@ def quantize_awq_style(
 def verify_scale_axis(weight: torch.Tensor, qt: QuantizedTensor, tol: float = 1e-2) -> bool:
     """Sanity-check that the stored scales are indexed consistently with the dequantiser.
 
-    Deliberately naive: re-derive the expected scale from the raw weight using the axis the
-    object claims, and compare.  A mismatch here is exactly the silent error described in
+    Deliberately naive: re-derive the expected scale from the raw weight using the *scheme the
+    object claims*, and compare.  A mismatch here is exactly the silent error described in
     risk R3.
+
+    The expected formula depends on the scheme, not just on the bit width: symmetric 4-bit
+    uses ``amax / 7``, asymmetric uses ``(max - min) / 15``.  Hard-coding one of them for both
+    would make this check reject its own quantiser.
     """
     w = weight.detach().to(torch.float32)
     if qt.axis == 1:
@@ -291,9 +298,11 @@ def verify_scale_axis(weight: torch.Tensor, qt: QuantizedTensor, tol: float = 1e
     k_pad = int(qt.meta.get("padded_in_features", w.shape[1]))
     if k_pad != w.shape[1]:
         w = torch.nn.functional.pad(w, (0, k_pad - w.shape[1]))
-    w_min = w.reshape(w.shape[0], -1, g).amin(-1)
-    w_max = w.reshape(w.shape[0], -1, g).amax(-1)
-    expected = (w_max - w_min) / 15.0
+    groups = w.reshape(w.shape[0], -1, g)
+    if qt.scheme.endswith("_sym"):
+        expected = torch.maximum(groups.amin(-1).abs(), groups.amax(-1).abs()) / 7.0
+    else:
+        expected = (groups.amax(-1) - groups.amin(-1)) / 15.0
     got = qt.scales.to(torch.float32)
     return bool(torch.allclose(expected, got, rtol=tol, atol=tol * 1e-4))
 

@@ -10,7 +10,8 @@ with sane throughput — and a test suite that checks those pieces against Huggi
 `transformers` numerically instead of asserting shapes and hoping.
 
 ```bash
-pip install -e ".[hf]"            # torch + transformers (transformers is test-only)
+pip install -e ".[hf]"            # torch + transformers (the server needs the tokenizer)
+pip install -e ".[dev]"           # ... plus pytest and the pinned transformers the tests expect
 qwen25vl-lite plan --model ./Qwen2.5-VL-3B-Instruct --vram-gb 8 --ram-gb 96 --weight-dtype int4
 qwen25vl-lite serve --model ./Qwen2.5-VL-3B-Instruct --device cuda --weight-dtype int4 \
                     --kv-dtype float16 --num-blocks 4000
@@ -25,21 +26,26 @@ qwen25vl-lite serve --model ./Qwen2.5-VL-3B-Instruct --device cuda --weight-dtyp
 | MRoPE matches HF **bit for bit** | `tests/test_model_vs_hf.py::test_mrope_cos_sin_and_apply_match_hf` uses `torch.equal` (zero tolerance) | passing |
 | Vision tower matches HF | `test_vision_tower_matches_hf`, `atol=1e-5` | passing |
 | End-to-end logits match HF (text and multimodal) | `test_full_logits_match_hf`, `test_text_only_logits_match_hf` | passing |
+| Multimodal logits match HF when windowed vision attention engages | `test_multimodal_logits_match_hf_with_windowing_engaged` (a 22x30 patch grid = 12 windows) | passing |
 | Chunked prefill == single-pass prefill | 20 combinations of chunk size {16, 8, 5, 3} x length {15, 16, 17, 33, 64}, compared to HF | passing |
 | Paged decode == HF's own incremental decoding, step by step | `test_paged_decode_matches_hf_incremental` | passing |
 | Batched decode == sequential decode (no KV-padding leakage) | `test_decode_batch_matches_independent_single_sequences` | passing |
 | Prefix-cache reuse == recomputing the prefix | `test_prefix_cache_reuses_and_matches_fresh_compute` | passing |
 | Greedy engine output == `transformers.generate` | `test_greedy_generation_matches_hf_generate` | passing |
-| Preemption keeps the block pool in budget and every request still finishes | `test_preemption_keeps_the_pool_within_budget` (+ a recompute variant) | passing |
-| Quantiser is self-consistent (scale axis, INT4 packing, AWQ objective) | `tests/test_components.py` | passing |
+| Preemption keeps the block pool in budget and every request still finishes | `test_preemption_keeps_the_pool_within_budget` (+ a recompute variant), which also asserts the pool returns to empty | passing |
+| Quantiser is self-consistent (scale axis, INT4 packing, AWQ objective) | `test_quantization_error_bounds`, `test_int4_pack_unpack_roundtrip`, `test_awq_beats_plain_groupwise`, `test_symmetric_int4_preserves_negative_weights` | passing |
+| The prefix cache evicts and returns blocks instead of leaking | `test_prefix_cache_eviction_actually_evicts_and_returns_blocks` | passing |
+| The block pool rejects unknown and double frees | `test_block_manager_rejects_bogus_frees` | passing |
+| Sampling penalties and validation actually apply | `test_engine_applies_sampling_penalties`, `test_engine_rejects_invalid_and_unsupported_sampling_params` | passing |
 
 ```
-$ python -m pytest tests/ -q
-98 passed
+$ python -m pytest tests/
+111 passed in 6.18s
 ```
 
 Everything runs on CPU with tiny random weights and **no model download**, so the suite is
-usable in CI and takes under 10 seconds.
+usable in CI. (`pyproject.toml` already sets `addopts = "-q"`, so pass `-q` again only if you
+want the summary line suppressed.)
 
 ## What is *not* verified — read this before quoting a number
 
@@ -119,6 +125,7 @@ qwen25vl_lite/
   imageproc.py      smart_resize + patchification matching the HF processor
   vision.py         the vision tower (window attention + PatchMerger)
   text.py           the decoder (GQA, SwiGLU, MRoPE, paged/chunked/dense attention)
+  layers.py         shared RMSNorm (plain formulation, float32 compute)
   model.py          assembly, streaming safetensors loading, forward pass
   cache.py          block manager, paged KV cache, radix prefix cache
   vision_budget.py  resolution budgets, pooling, ToME merge, FastV selection
@@ -129,6 +136,10 @@ qwen25vl_lite/
   server.py         OpenAI-compatible HTTP API (stdlib only)
   cli.py            `plan`, `probe`, `tiers`, `bench`, `generate`, `serve`
 ```
+
+Supporting scripts: `scripts/demo.py` (end-to-end walkthrough), `scripts/make_tiny_model.py`
+(the random fixture used by the gates and tests), `scripts/quality_gate.py` (Gates A/B/C),
+`bench/run_bench.py` (throughput and memory on your hardware).
 
 ### The five things that make it fit in 8 GB
 
@@ -216,7 +227,9 @@ The review separated two kinds of risk that are easy to conflate: **implementati
 approximations** (quantisation, merging, pruning, resolution reduction). Without that split,
 you cannot tell whether a changed output is expected degradation or a bug.
 
-Three gates, runnable with `python scripts/quality_gate.py --model <dir>`:
+Three gates, all runnable with `python scripts/quality_gate.py --model <dir> --gate all`
+(`--gate` defaults to `A`, so name the ones you want; `--tiny` uses a random fixture instead of
+a real checkpoint):
 
 * **Gate A — reference equivalence.** Quantisation and pruning off; compare intermediate
   tensors and final logits against `transformers`. This is what the test suite automates.
@@ -267,9 +280,10 @@ Stated plainly, because the alternative is a user discovering them:
 ## Tests
 
 ```bash
-python -m pytest tests/ -q            # 98 tests, CPU-only, no downloads
-python -m pytest tests/test_model_vs_hf.py -q   # the equivalence gate on its own
-python -m pytest tests/test_chunked_prefill.py -q
+pip install -e ".[dev]"              # pytest + the pinned transformers
+python -m pytest tests/              # 111 tests, CPU-only, no downloads
+python -m pytest tests/test_model_vs_hf.py    # the equivalence gate on its own
+python -m pytest tests/test_chunked_prefill.py
 ```
 
 The suite needs `transformers` for the reference model, and builds a tiny random-weight
@@ -282,7 +296,10 @@ between releases, and 5.20 did: it renamed a rotary-embedding class, replaced
 the cos/sin tables. So "matches transformers" is a claim about a version, not a moving target.
 The two tests that inspect HF internals use instantiated modules rather than private class
 names and skip with a stated reason on other versions; the end-to-end equivalence tests run
-everywhere. On 5.16.1 the suite is 101 passed; on 5.20 it is 101 passed, 2 skipped.
+everywhere. On the pinned 5.16.1 the suite is 111 passed; under 5.20 it is 111 passed,
+2 skipped. That second number was produced by running the suite in a scratch virtualenv with
+`pip install -U transformers`; it is not reproducible from the pinned `dev` extra by design,
+because the pin exists to keep CI on the verified version.
 
 ## License
 

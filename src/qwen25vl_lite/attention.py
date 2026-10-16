@@ -6,8 +6,10 @@ The engine never *assumes* which SDPA backend will be selected -- the review of
 manager and records whether it succeeded, and the chosen backend is reported to the user
 and written to logs.  ``--attn-backend`` pins a backend when you want reproducible numbers.
 
-The paged path is implemented twice: a gather-based reference that is exact and runs
-anywhere (used in tests and on CPU), and an optional compiled kernel (see ``native.py``).
+The paged path is a gather-based reference: exact, dependency-free, and runnable anywhere
+(used in tests and on CPU).  There is deliberately no fused kernel here -- a compiled
+dequantise-and-attend kernel could only be verified against this reference on a GPU, and a
+subtly wrong fused kernel produces plausible output rather than an error.
 """
 
 from __future__ import annotations

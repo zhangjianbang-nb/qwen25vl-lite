@@ -11,7 +11,9 @@ Two distinct schemes live here:
   duplicated to fill ``head_dim``.
 
 Everything here is written to match ``transformers.models.qwen2_5_vl`` element for
-element -- ``tests/test_mrope_matches_hf.py`` asserts that with no tolerance.
+element -- ``tests/test_model_vs_hf.py`` asserts that with no tolerance, against the
+version pinned in ``pyproject.toml`` (HF moves these internals between releases; see the
+note in that file).
 """
 
 from __future__ import annotations
@@ -104,10 +106,10 @@ def vision_position_ids(
 ) -> torch.Tensor:
     """3D position ids for one image/video, offset by ``start_position``.
 
-    Returns ``[3, tokens]`` ordered ``(t, h, w)``.  Note that the *height* and *width*
-    axes are both offset by ``start_position`` while the temporal axis starts at 0 and is
-    only scaled by ``time_interval`` -- this is what makes the temporal index a genuine
-    third axis rather than a running counter.
+    Returns ``[3, tokens]`` ordered ``(t, h, w)``.  All three axes are offset by
+    ``start_position``; the temporal axis is additionally scaled by ``time_interval``
+    *before* the offset is applied, so ``t`` advances by ``time_interval`` per temporal
+    patch while still continuing the running sequence position.
     """
     t, h, w = int(grid_thw[0]), int(grid_thw[1]), int(grid_thw[2])
     llm_t = t // temporal_merge_size
@@ -200,7 +202,20 @@ def get_rope_index(
                     )
                 grid = next(grids[modality])
                 if modality == 2:
-                    interval = tokens_per_second * int(next(seconds)) if seconds is not None else tokens_per_second
+                    if seconds is not None:
+                        # Position ids are integer steps here, so a fractional seconds-per-grid
+                        # value cannot be represented.  Truncating it silently would produce a
+                        # plausible but wrong temporal axis, so it is refused instead.  The video
+                        # path is not part of the verified scope (see README).
+                        spg = float(next(seconds))
+                        if spg != int(spg):
+                            raise ValueError(
+                                f"fractional second_per_grid_ts ({spg}) is not supported: the "
+                                f"temporal interval would not be an integer position step"
+                            )
+                        interval = tokens_per_second * int(spg)
+                    else:
+                        interval = tokens_per_second
                 else:
                     interval = 1
                 chunks.append(

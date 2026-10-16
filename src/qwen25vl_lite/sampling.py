@@ -85,11 +85,17 @@ def sample_token(logits: torch.Tensor, params: SamplingParams, generator: Option
         sorted_scores, order = torch.sort(scores, descending=True)
         probs = torch.softmax(sorted_scores, dim=-1)
         cumulative = torch.cumsum(probs, dim=-1)
-        # Keep the smallest prefix whose cumulative mass reaches top_p (always at least one).
-        keep = cumulative <= params.top_p
+        # Keep the smallest prefix whose cumulative mass *reaches* top_p.  The comparison must
+        # be `>=` on the crossing token: using `<=` drops the token that crosses the threshold,
+        # so the retained mass would be strictly less than top_p (and could be a single token
+        # for a peaked distribution, which is not nucleus sampling).
+        crossing = (cumulative >= params.top_p).nonzero(as_tuple=True)[0]
+        keep = torch.zeros_like(cumulative, dtype=torch.bool)
         keep[0] = True
-        if not bool(keep.any()):
-            keep[0] = True
+        if crossing.numel():
+            keep[: int(crossing[0]) + 1] = True
+        else:
+            keep[:] = True
         filtered = torch.full_like(sorted_scores, float("-inf"))
         filtered[keep] = sorted_scores[keep]
         scores = torch.empty_like(scores).scatter_(0, order, filtered)

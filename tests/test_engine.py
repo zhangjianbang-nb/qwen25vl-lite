@@ -101,7 +101,12 @@ def test_preemption_keeps_the_pool_within_budget(tiny_model_dir):
     stats = engine.stats()
     assert len(outs) == 4, "every request must still complete after preemption"
     assert stats["preemptions"] > 0, "the test configuration should have forced preemption"
-    assert stats["kv_blocks_used"] <= stats["kv_blocks_total"]
+    # `kv_blocks_used <= kv_blocks_total` holds by construction (`in_use()` is defined as
+    # num_blocks - len(free)), so it asserts nothing.  The real claim is that the pool returns
+    # to empty once every sequence has finished: no leaked blocks, no double ownership.
+    assert stats["kv_blocks_used"] == 0, (
+        f"{stats['kv_blocks_used']} blocks were still held after every request finished"
+    )
 
 
 def test_preemption_by_recompute_also_completes(tiny_model_dir):
@@ -189,3 +194,55 @@ def test_request_longer_than_max_model_len_is_rejected(tiny_model_dir):
     engine, cfg, model_dir, hf = _stack(tiny_model_dir, max_model_len=64)
     with pytest.raises(ValueError):
         engine.add_request(list(range(1, 100)), SamplingParams(temperature=0.0, max_tokens=1))
+
+
+# ---------------------------------------------------------------------------------------
+# regressions found by the delivery validators (2026-10-15)
+# ---------------------------------------------------------------------------------------
+
+
+def test_engine_applies_sampling_penalties(tiny_model_dir):
+    """`apply_penalties` existed but was never called on the engine path, so repetition,
+    presence and frequency penalties silently had no effect."""
+    from qwen25vl_lite.sampling import apply_penalties
+
+    engine, cfg, model_dir, hf = _stack(tiny_model_dir)
+    prompt = [3, 4, 5, 6, 7, 8]
+    engine.add_request(prompt, SamplingParams(temperature=0.0, max_tokens=8, ignore_eos=True))
+    out = engine.run_until_complete()[0]
+    logits = torch.randn(cfg.text_config.vocab_size)
+    logits[out.output_token_ids[0]] = 10.0
+    plain = SamplingParams(temperature=0.0, max_tokens=8, ignore_eos=True)
+    penalised = SamplingParams(temperature=0.0, max_tokens=8, ignore_eos=True,
+                               repetition_penalty=100.0)
+    assert int(torch.argmax(apply_penalties(logits, out.output_token_ids, plain))) == \
+        out.output_token_ids[0]
+    assert int(torch.argmax(apply_penalties(logits, out.output_token_ids, penalised))) != \
+        out.output_token_ids[0], (
+        "a repetition penalty of 100 must suppress the token that was already generated"
+    )
+
+
+def test_engine_rejects_invalid_and_unsupported_sampling_params(tiny_model_dir):
+    engine, cfg, model_dir, hf = _stack(tiny_model_dir)
+    with pytest.raises(ValueError):
+        engine.add_request([1, 2, 3], SamplingParams(temperature=-1.0))
+    with pytest.raises(ValueError):
+        engine.add_request([1, 2, 3], SamplingParams(top_p=0.0))
+    with pytest.raises(ValueError, match="stop"):
+        engine.add_request([1, 2, 3], SamplingParams(stop=("</s>",)))
+
+
+def test_prefix_cache_references_are_released_when_a_request_finishes(tiny_model_dir):
+    """The engine never called `release`, so cached blocks were pinned forever.  After the
+    request finishes, the cache keeps its own reference but the pool must be reclaimable."""
+    engine, cfg, model_dir, hf = _stack(tiny_model_dir, enable_prefix_cache=True)
+    prompt = list(range(20, 60))
+    engine.add_request(prompt, SamplingParams(temperature=0.0, max_tokens=4, ignore_eos=True))
+    engine.run_until_complete()
+    pc = engine.runner.prefix_cache
+    assert pc.hits + pc.misses > 0
+    users = [n.refcount for n in pc.nodes.values() if n.block_ids]
+    assert users and all(r == 0 for r in users), (
+        f"cached nodes still report live users after every request finished: {users}"
+    )

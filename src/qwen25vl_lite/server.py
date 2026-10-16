@@ -191,9 +191,12 @@ class EngineService:
 
 
 def _parse_params(body: Dict[str, Any]) -> SamplingParams:
-    stop = body.get("stop") or ()
-    if isinstance(stop, str):
-        stop = (stop,)
+    """Decoding parameters, engine-safe.
+
+    String ``stop`` sequences are deliberately *not* forwarded: the engine has no tokenizer,
+    so it refuses them rather than silently ignoring them.  They are resolved here against
+    decoded text by :func:`_apply_stops`, which is where a tokenizer exists.
+    """
     return SamplingParams(
         temperature=float(body.get("temperature", 0.0) or 0.0),
         top_p=float(body.get("top_p", 1.0) or 1.0),
@@ -203,9 +206,27 @@ def _parse_params(body: Dict[str, Any]) -> SamplingParams:
         presence_penalty=float(body.get("presence_penalty", 0.0) or 0.0),
         frequency_penalty=float(body.get("frequency_penalty", 0.0) or 0.0),
         seed=body.get("seed"),
-        stop=tuple(stop),
         ignore_eos=bool(body.get("ignore_eos", False)),
     )
+
+
+def _stops(body: Dict[str, Any]) -> Tuple[str, ...]:
+    stop = body.get("stop") or ()
+    if isinstance(stop, str):
+        stop = (stop,)
+    return tuple(str(s) for s in stop)
+
+
+def _apply_stops(text: str, stops: Tuple[str, ...]) -> str:
+    """Truncate ``text`` at the earliest occurrence of any stop sequence."""
+    cut = len(text)
+    for s in stops:
+        if not s:
+            continue
+        idx = text.find(s)
+        if idx != -1:
+            cut = min(cut, idx)
+    return text[:cut]
 
 
 def make_handler(service: EngineService):
@@ -308,14 +329,35 @@ def make_handler(service: EngineService):
                 return
 
             streaming = bool(body.get("stream", False))
+            stops = _stops(body)
             if streaming:
                 self._sse_start()
                 emitted = 0
                 first = True
                 for update in stream:
-                    text = self.service_ref.decode(update.output_token_ids)
+                    text = _apply_stops(self.service_ref.decode(update.output_token_ids), stops)
                     chunk = text[emitted:]
                     emitted = len(text)
+                    hit_stop = len(text) < len(self.service_ref.decode(update.output_token_ids))
+                    if hit_stop:
+                        # A stop sequence was produced: emit what is left of the visible text
+                        # and end the stream here rather than letting the model run on.
+                        if chunk:
+                            delta = {"role": "assistant", "content": chunk} if first else {"content": chunk}
+                            first = False
+                            if chat:
+                                self._sse({
+                                    "id": completion_id, "object": "chat.completion.chunk",
+                                    "created": created, "model": self.service_ref.model_name,
+                                    "choices": [{"index": 0, "delta": delta, "finish_reason": "stop"}],
+                                })
+                            else:
+                                self._sse({
+                                    "id": completion_id, "object": "text_completion",
+                                    "created": created, "model": self.service_ref.model_name,
+                                    "choices": [{"index": 0, "text": chunk, "finish_reason": "stop"}],
+                                })
+                        break
                     if not chunk:
                         continue
                     delta = {"role": "assistant", "content": chunk} if first else {"content": chunk}
@@ -334,9 +376,17 @@ def make_handler(service: EngineService):
                             "choices": [{"index": 0, "text": chunk,
                                          "finish_reason": update.finish_reason or None}],
                         })
-                self._sse({"id": completion_id, "object": "chat.completion.chunk", "created": created,
-                           "model": self.service_ref.model_name,
-                           "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
+                # The terminal event must carry the same object type as the stream it ends:
+                # a `/v1/completions` stream reporting `chat.completion.chunk` here was an
+                # inconsistency clients could reasonably trip over.
+                if chat:
+                    self._sse({"id": completion_id, "object": "chat.completion.chunk", "created": created,
+                               "model": self.service_ref.model_name,
+                               "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
+                else:
+                    self._sse({"id": completion_id, "object": "text_completion", "created": created,
+                               "model": self.service_ref.model_name,
+                               "choices": [{"index": 0, "text": "", "finish_reason": "stop"}]})
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
                 return
@@ -345,7 +395,7 @@ def make_handler(service: EngineService):
             for update in stream:
                 final = update
             assert final is not None
-            text = self.service_ref.decode(final.output_token_ids)
+            text = _apply_stops(self.service_ref.decode(final.output_token_ids), stops)
             if chat:
                 self._send_json({
                     "id": completion_id, "object": "chat.completion", "created": created,

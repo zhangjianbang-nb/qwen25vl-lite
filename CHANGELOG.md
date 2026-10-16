@@ -41,7 +41,7 @@ GPU-measured performance numbers ship with it (see "Not included" below).
   machine's reclaimable memory.
 - **Quality gates** (`scripts/quality_gate.py`): Gate A against `transformers`, Gate B per
   quantisation scheme, Gate C per vision tier. Runnable without a real checkpoint (`--tiny`).
-- **Tests**: 101 tests, CPU-only, no checkpoint download. Includes a 20-combination chunked
+- **Tests**: 111 tests, CPU-only, no checkpoint download. Includes a 20-combination chunked
   prefill equivalence matrix, step-by-step paged-decode parity with HF, batched-vs-sequential
   decode parity, prefix-cache reuse parity, greedy generation parity with
   `transformers.generate`, and a multimodal case with a large enough image to engage windowed
@@ -105,7 +105,83 @@ Two changes:
   and skip with an explicit reason on versions whose convention differs. The end-to-end
   equivalence tests run on every version and pass on both 5.16.1 and 5.20.
 
-Result: `pytest tests/ -q` → 101 passed on 5.16.1; 101 passed, 2 skipped on 5.20.
+Result: `pytest tests/` → 111 passed on 5.16.1; 111 passed, 2 skipped on 5.20. (Note that
+`pyproject.toml` already sets `addopts = "-q"`, so adding `-q` again suppresses the summary
+line — the counts above come from `pytest tests/`.)
+
+### Fixed after delivery validation (2026-10-15)
+
+Two independent reviewers went through the codebase and the documentation. Both scored below
+the release bar, and every substantive finding is fixed here with a regression test:
+
+**Engine correctness**
+
+- **Symmetric INT4 was numerically broken.** It used `scale = amax/7` with a zero point of
+  `0`, so `round(w/scale).clamp(0, 15)` clamped every negative weight to zero and
+  dequantisation returned `0` for it. The signed range needs a zero point of `8`; fixed, and
+  the zero point is now always stored. `test_symmetric_int4_preserves_negative_weights`,
+  `test_symmetric_int4_uses_the_signed_zero_point`.
+- **`verify_scale_axis` rejected its own symmetric quantiser** — it hard-coded the asymmetric
+  formula `(max-min)/15` for 4-bit regardless of scheme. It now branches on the scheme.
+  `test_verify_scale_axis_accepts_the_symmetric_quantiser`.
+- **`RadixPrefixCache._evict_if_needed` never evicted anything.** It popped only the victim's
+  children, never removed the victim, and never released its blocks, so the tree grew past its
+  budget while permanently draining the block pool. It now detaches the victim, drops its whole
+  subtree, and frees the cache's block references.
+  `test_prefix_cache_eviction_actually_evicts_and_returns_blocks`.
+- **Prefix-cache user counts only ever rose.** `release` was the only decrement path and the
+  engine never called it, so no node was ever evictable; and `insert` counted the *donating*
+  sequence as a user, which left every donated node pinned. `insert` now starts nodes at
+  `refcount = 0`, `release` only decrements (it was also double-freeing), and the engine calls
+  `release` when a request finishes.
+  `test_prefix_cache_release_makes_a_node_evictable`,
+  `test_prefix_cache_references_are_released_when_a_request_finishes`.
+- **`BlockManager.free_blocks` accepted unknown, out-of-range and duplicate ids**, pushing a
+  bogus id onto the free list that `allocate` would then hand out — a slot mapping that writes
+  outside the KV tensor. It now raises. `test_block_manager_rejects_bogus_frees`.
+- **Sampling penalties were implemented but never applied.** `apply_penalties` had no call site,
+  so `repetition_penalty` / `presence_penalty` / `frequency_penalty` silently did nothing;
+  `SamplingParams.validate()` was never called; and string `stop` sequences were ignored. All
+  three now go through one `_sample` helper, params are validated at `add_request`, and string
+  stops are resolved against decoded text in the server (the engine refuses them rather than
+  ignoring them). `test_engine_applies_sampling_penalties`,
+  `test_engine_rejects_invalid_and_unsupported_sampling_params`.
+- **Top-p dropped the token that crossed the threshold** (`cumulative <= top_p`), so the
+  retained mass was strictly less than `top_p`. Now the crossing token is kept.
+  `test_top_p_keeps_the_token_that_crosses_the_threshold`.
+- **Pass 2 of the scheduler could adopt a prefix twice** on a preemption retry, forking blocks
+  and double-counting hits. `_adopt_prefix` is now idempotent and adoption happens after the
+  "nothing left to prefill" check.
+- `EngineConfig` now validates the tier itself, so the `pruned` tier's FastV settings cannot
+  bypass validation; an unknown tier raises a message listing the valid names; a fractional
+  `second_per_grid_ts` is refused instead of silently truncated.
+
+**Tests that asserted nothing**
+
+- `test_quant_linear_moves_buffers_with_to` wrote `ql.to(...) if False else ql`, so `.to()` was
+  never called. `test_preemption_keeps_the_pool_within_budget` asserted
+  `kv_blocks_used <= kv_blocks_total`, which holds by construction; it now asserts the pool
+  returns to **zero** blocks after every request finishes.
+
+**Documentation**
+
+- The README's test count said 98 (actual 111) and its `pytest tests/ -q` transcript could not
+  be produced by that command, because `addopts` already sets `-q` and `-qq` suppresses the
+  summary. Corrected.
+- The README documented a `--attn-backend` flag that did not exist. The flag is now implemented
+  in the CLI and wired to `EngineConfig.attn_backends`.
+- "transformers is test-only" was wrong (the server needs it for the tokenizer), and the
+  install instructions used the unpinned `.[hf]` extra while the correctness claim is about the
+  pinned 5.16.1. Both fixed, and the Tests section now says to install `.[dev]`.
+- `python scripts/quality_gate.py --model <dir>` defaults to `--gate A`, so it does not run all
+  three gates; the README now says `--gate all`.
+- The architecture listing omitted `layers.py` and the supporting scripts; the module map is
+  complete, and the quantiser row now names its tests.
+- Docstrings in `attention.py` and `rope.py` referenced a `native.py` that does not exist, the
+  wrong test filename, and a `vision_position_ids` temporal-axis rule the code does not follow.
+  All corrected.
+- The server's streaming `/v1/completions` emitted a terminal event typed
+  `chat.completion.chunk`; it now matches the stream's `text_completion`.
 
 ### Not included
 

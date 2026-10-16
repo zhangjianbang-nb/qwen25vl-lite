@@ -112,6 +112,9 @@ def _load(args: argparse.Namespace):
 
 
 def _engine(args: argparse.Namespace, model):
+    pinned = None
+    if getattr(args, "attn_backend", None):
+        pinned = [b.strip() for b in args.attn_backend.split(",") if b.strip()]
     ecfg = EngineConfig(
         num_blocks=args.num_blocks,
         block_size=args.block_size,
@@ -127,6 +130,7 @@ def _engine(args: argparse.Namespace, model):
         fastv_ratio=args.fastv_ratio,
         fastv_layer=args.fastv_layer,
         preemption=args.preemption,
+        attn_backends=pinned,
         device=args.device,
         dtype={"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}[args.dtype],
     )
@@ -214,6 +218,9 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--fastv-ratio", type=float, default=0.5)
         p.add_argument("--fastv-layer", type=int, default=2)
         p.add_argument("--preemption", default="swap", choices=["swap", "recompute"])
+        p.add_argument("--attn-backend", default=None,
+                       help="comma-separated SDPA backends to pin, e.g. math,flash "
+                            "(default: probe at runtime and pick the fastest that works)")
 
     p = sub.add_parser("plan", help="show the memory plan and KV arithmetic")
     p.add_argument("--model", default=None)
