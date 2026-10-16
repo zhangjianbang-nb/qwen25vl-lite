@@ -129,8 +129,15 @@ class TextAttention(nn.Module):
             else:
                 mask = build_chunk_mask(query_lens, context_lens, q.device, q.dtype)
             if want_probs:
-                offset = int(context_lens.max().item()) - q_len
-                out, probs = self._probs(q, k, v, mask, offset, backends)
+                # Probabilities are only wanted for the FastV dense pass, which runs without a
+                # cache.  With a cache the batch is heterogeneous and one scalar query offset
+                # cannot describe it -- the previous code used `context_lens.max() - q_len` for
+                # the whole batch, which is wrong for every shorter sequence.  Refuse it rather
+                # than return importances that are subtly wrong.
+                raise ValueError(
+                    "want_probs is only supported without a KV cache (the FastV dense pass); "
+                    "with a cache a single query offset cannot describe a heterogeneous batch"
+                )
             else:
                 out = sdpa(q, k, v, attn_mask=mask, scale=self.scaling, backends=backends,
                            enable_gqa=True, num_kv_groups=self.num_kv_groups)

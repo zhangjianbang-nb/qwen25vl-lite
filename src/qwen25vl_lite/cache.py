@@ -42,6 +42,9 @@ class BlockManager:
         self.num_blocks = num_blocks
         self.block_size = block_size
         self.free: List[int] = list(range(num_blocks))
+        # A set alongside the list: `free_blocks` needs an O(1) "is this block already free"
+        # test, and the list version made releasing a batch O(n^2) on the memory-pressure path.
+        self._free_set: set = set(self.free)
         self.refcount: Dict[int, int] = {i: 0 for i in range(num_blocks)}
 
     @property
@@ -53,6 +56,7 @@ class BlockManager:
             raise MemoryError(f"cannot allocate {n} blocks; only {len(self.free)} free")
         out = [self.free.pop() for _ in range(n)]
         for b in out:
+            self._free_set.discard(b)
             self.refcount[b] = 1
         return out
 
@@ -96,8 +100,9 @@ class BlockManager:
             rc -= 1
             if rc == 0:
                 self.refcount[b] = 0
-                if b not in self.free:
+                if b not in self._free_set:
                     self.free.append(b)
+                    self._free_set.add(b)
             else:
                 self.refcount[b] = rc
 
@@ -272,7 +277,13 @@ class RadixPrefixCache:
                 self.bm.free_blocks(node.block_ids)
 
     def _evictable(self) -> List[int]:
-        """Node ids that may be dropped, least-recently-used first."""
+        """Node ids that may be dropped, least-recently-used first.
+
+        Complexity is O(nodes) to scan plus O(nodes) per candidate to test its subtree, so a
+        full pass is O(n^2) in the worst case.  The tree is small in practice (the budget is
+        `max_nodes`, default in the low thousands) and eviction only runs under memory pressure,
+        so this is left simple and correct rather than optimised with a maintained invariant.
+        """
         return sorted(
             (nid for nid, n in self.nodes.items()
              if n.parent is not None and n.refcount == 0 and self._subtree_is_evictable(nid)),

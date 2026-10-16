@@ -77,6 +77,10 @@ class EngineConfig:
             raise ValueError("block_size and num_blocks must be positive")
         if self.max_num_seqs <= 0:
             raise ValueError("max_num_seqs must be positive")
+        if self.max_num_batched_tokens <= 0:
+            raise ValueError("max_num_batched_tokens must be positive")
+        if self.max_model_len < self.block_size:
+            raise ValueError("max_model_len must be at least one block")
         if self.preemption not in ("swap", "recompute"):
             raise ValueError("preemption must be 'swap' or 'recompute'")
         if self.enable_fastv and self.fastv_layer >= 1 and self.fastv_ratio <= 0:
@@ -335,12 +339,14 @@ class ModelRunner:
             )
         probs = captured["probs"]
 
+        original_len = len(seq.prompt_token_ids)
+        original_delta = seq.rope_delta
         keep = fastv_select(probs, image_positions, self.fastv_ratio)
         # Reuse the library helper rather than a second, inlined copy of the same logic: two
         # implementations of "which tokens survive" can drift, and only one of them would be
         # covered by the unit tests.  `keep` holds *token positions*, so mapping them back to
         # ordinals among the image tokens is still needed to index the vision features.
-        _, position_ids, new_ids, keep_mask = apply_fastv(
+        pruned_hidden, position_ids, new_ids, keep_mask = apply_fastv(
             seq.prompt_token_ids, hidden[0], seq.prompt_position_ids, image_positions, keep
         )
         ordinal = {pos_i: idx for idx, pos_i in enumerate(image_positions)}
@@ -353,10 +359,11 @@ class ModelRunner:
             seq.image_cursor = seq.vision_features.shape[0]
         # The image tokens that actually made it into the KV cache -- what the stat should count.
         seq.extra["vision_tokens_prefilled"] = len(kept_ordinals)
-        # rope_delta is `max(position) + 1 - seq_len`, and pruning changes both terms.  Leaving
-        # the old value made the first decode step's position fall back behind the prompt's own
-        # positions, so every generated token was rotated wrongly.
-        seq.rope_delta = int(seq.prompt_position_ids.max().item()) + 1 - len(new_ids)
+        # Decode continues from the *original* cursor -- `rope_delta + original_len` -- not from
+        # the largest surviving position: if the last image token is pruned, the surviving
+        # maximum is smaller than the cursor and decoding would restart inside the prompt's own
+        # coordinate range.  Recomputing from `max()` was exactly that bug.
+        seq.rope_delta = original_delta + original_len - len(new_ids)
         self._shrink_blocks(seq, len(new_ids))
 
         n_heads = self.cache.num_kv_heads
@@ -369,7 +376,7 @@ class ModelRunner:
 
         ctx = torch.tensor([len(new_ids)], dtype=torch.long, device=self.device)
         out = self.model.language_model(
-            hidden[0][keep_mask].unsqueeze(0),
+            pruned_hidden.unsqueeze(0),
             seq.prompt_position_ids,
             cache=self.cache,
             slot_mapping=slots,
@@ -478,6 +485,16 @@ class LLMEngine:
             raise ValueError("prompt is empty")
         if len(ids) > self.ecfg.max_model_len:
             raise ValueError(f"prompt of {len(ids)} tokens exceeds max_model_len {self.ecfg.max_model_len}")
+        if not self.ecfg.enable_chunked_prefill and len(ids) > self.ecfg.max_num_batched_tokens:
+            # Without chunked prefill a prompt larger than one step's budget can never be
+            # scheduled.  Raising here keeps the engine healthy: the alternative was to raise
+            # from inside the scheduler, which left the request at the head of the queue and
+            # made *every* later step fail, taking unrelated requests down with it.
+            raise ValueError(
+                f"prompt of {len(ids)} tokens exceeds max_num_batched_tokens="
+                f"{self.ecfg.max_num_batched_tokens} and chunked prefill is disabled; "
+                "enable chunked prefill or raise max_num_batched_tokens"
+            )
 
         seq = SequenceState(
             seq_id=self._next_id,
@@ -645,14 +662,10 @@ class LLMEngine:
             elif remaining <= budget:
                 chunk = remaining
             else:
-                # Without chunked prefill a prompt larger than the per-step budget can never be
-                # scheduled.  Breaking here left the request queued forever and surfaced as the
-                # stall guard's "no progress" error; name the real problem instead.
-                raise ValueError(
-                    f"prompt of {remaining} tokens exceeds max_num_batched_tokens="
-                    f"{self.ecfg.max_num_batched_tokens} and chunked prefill is disabled; "
-                    "enable chunked prefill or raise max_num_batched_tokens"
-                )
+                # Unreachable: `add_request` refuses a prompt that cannot fit one step when
+                # chunked prefill is off.  Kept as a guard so a future caller cannot reintroduce
+                # a request that the scheduler can never admit.
+                break
 
             try:
                 self.runner.ensure_blocks(seq, seq.num_computed_tokens + chunk)
@@ -694,7 +707,15 @@ class LLMEngine:
         # releasing here pins the cache node forever, because `match` is the only thing that
         # raises the count and nothing else lowers it.
         self._release_prefix(victim)
-        if self.ecfg.preemption == "swap":
+        # FastV rewrites the prompt in place (ids, positions and the vision features it keeps),
+        # and recompute preemption has no way to restore what was dropped -- re-running the
+        # dense pass would prune an already-pruned sequence.  Swap keeps the KV and never
+        # re-runs prefill, so it is the only safe mode for a pruned request.
+        if victim.extra.get("fastv_will_prune") and self.ecfg.preemption != "swap":
+            victim.swap_payload = self.runner.cache.swap_out(victim.block_table)
+            victim.status = "swapped"
+            self.swapped.append(victim)
+        elif self.ecfg.preemption == "swap":
             victim.swap_payload = self.runner.cache.swap_out(victim.block_table)
             victim.status = "swapped"
             self.swapped.append(victim)
@@ -771,9 +792,11 @@ class LLMEngine:
                 raise
             seq.num_computed_tokens = end
             self.runner.stats.prefill_chunks += 1
-            if start == 0:
-                # FastV removes image tokens, so the pre-prune count would overstate what was
-                # actually prefilled.  `vision_tokens_prefilled` is set by the FastV path.
+            if start == 0 and not seq.extra.get("vision_counted"):
+                # Counted once per request, at first prefill: re-prefilling after a recompute
+                # preemption must not count the same image tokens again, and FastV's survivors
+                # (not the pre-prune total) are what was actually prefilled.
+                seq.extra["vision_counted"] = True
                 self.runner.stats.vision_tokens_total += seq.extra.get(
                     "vision_tokens_prefilled", seq.extra.get("n_image_tokens", 0)
                 )
@@ -916,6 +939,37 @@ class LLMEngine:
                     },
                 )
             )
+
+    def cancel(self, seq_id: int, reason: str = "stop") -> bool:
+        """Finish a sequence early and release its resources.
+
+        The serving layer needs this: when a stop string is produced it ends the HTTP stream, but
+        without a cancel the engine kept generating to `max_tokens` and caching a prefix nobody
+        will use.  Returns True if the sequence was still live.
+        """
+        for bucket in (self.running, self.waiting, self.swapped):
+            for seq in list(bucket):
+                if seq.seq_id != seq_id:
+                    continue
+                seq.status = "finished"
+                seq.finish_reason = reason
+                self._release_prefix(seq)
+                self.runner.free(seq)
+                bucket.remove(seq)
+                self.finished.append(RequestOutput(
+                    seq_id=seq.seq_id,
+                    prompt_token_ids=self._reported_prompt(seq),
+                    output_token_ids=list(seq.output_token_ids),
+                    finish_reason=reason,
+                    metrics={
+                        "prompt_tokens": float(len(seq.submitted_prompt_token_ids or seq.prompt_token_ids)),
+                        "prompt_tokens_prefilled": float(len(seq.prompt_token_ids)),
+                        "completion_tokens": float(len(seq.output_token_ids)),
+                        "elapsed_s": time.time() - seq.arrival,
+                    },
+                ))
+                return True
+        return False
 
     # -- driver ------------------------------------------------------------------------
     def has_work(self) -> bool:

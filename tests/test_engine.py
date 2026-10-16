@@ -386,15 +386,17 @@ def test_fastv_recomputes_rope_delta_for_the_pruned_prompt(tiny_model_dir, tiny_
     engine.step()
     seq = engine.running[0]
     assert len(seq.prompt_token_ids) < len(ids), "the fixture must actually prune"
-    expected = int(seq.prompt_position_ids.max().item()) + 1 - len(seq.prompt_token_ids)
-    assert seq.rope_delta == expected, (
-        f"rope_delta={seq.rope_delta} was not recomputed after pruning (expected {expected})"
+    # The invariant is about the *original* cursor, not the largest surviving position: if the
+    # last image token is pruned, recomputing from max() would restart decoding inside the
+    # prompt's own coordinate range.  Derive the cursor independently from the submitted ids.
+    orig_pos, _delta = engine.runner.model.position_ids(
+        torch.tensor([ids]), image_grid_thw=tiny_inputs["image_grid_thw"]
     )
-    # The token generated right after the prompt must continue from the kept tokens' positions.
+    cursor = int(orig_pos.max()) + 1
     pos = text_position_ids(1, len(seq.prompt_token_ids), seq.rope_delta, "cpu")
-    assert int(pos.max()) == int(seq.prompt_position_ids.max()) + 1, (
-        f"the first decoded token got position {int(pos.max())}, but the prompt ends at "
-        f"{int(seq.prompt_position_ids.max())}"
+    assert int(pos.max()) == cursor, (
+        f"the first decoded token got position {int(pos.max())}, but the prompt's cursor is "
+        f"{cursor}; decoding must continue from the cursor"
     )
 
 
@@ -420,15 +422,18 @@ def test_fastv_requests_stay_out_of_the_prefix_cache(tiny_model_dir, tiny_inputs
     )
 
 
-def test_disabling_chunked_prefill_with_a_long_prompt_fails_loudly(tiny_model_dir):
-    """A prompt that cannot fit one step used to leave the request queued forever and surface as
-    the stall guard's 'no progress'; the real problem is the configuration."""
+def test_disabling_chunked_prefill_with_a_long_prompt_is_refused_at_submission(tiny_model_dir):
+    """A prompt that cannot fit one step is unschedulable.  It is refused when submitted: raising
+    from inside the scheduler left the request at the head of the queue and made every later step
+    fail, so an unrelated request would have taken the whole engine down."""
     engine, cfg, model_dir, hf = _stack(tiny_model_dir, enable_chunked_prefill=False,
                                         max_num_batched_tokens=8)
-    engine.add_request(list(range(1, 40)), SamplingParams(temperature=0.0, max_tokens=2,
-                                                          ignore_eos=True))
     with pytest.raises(ValueError, match="chunked prefill is disabled"):
-        engine.run_until_complete()
+        engine.add_request(list(range(1, 40)), SamplingParams(temperature=0.0, max_tokens=2,
+                                                             ignore_eos=True))
+    # The engine is still healthy: a request that does fit is served normally.
+    engine.add_request([1, 2, 3], SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True))
+    assert len(engine.run_until_complete()) == 1
 
 
 def test_run_until_complete_reports_only_this_call(tiny_model_dir):
@@ -453,3 +458,54 @@ def test_kv_storage_dtype_must_match_the_compute_dtype(tiny_model_dir):
     ecfg = EngineConfig(num_blocks=8, block_size=16, kv_dtype="float16", dtype=torch.float32)
     with pytest.raises(ValueError, match="KV storage must match"):
         ModelRunner(model, ecfg, device="cpu")
+
+
+def test_fastv_survives_recompute_preemption_without_pruning_twice(tiny_model_dir, tiny_inputs):
+    """Recompute preemption cannot restore a FastV-pruned prompt: re-running the dense pass would
+    prune an already-pruned sequence, so the output would depend on whether a preemption happened.
+    A pruned request is therefore preempted by swap, which never re-runs prefill."""
+    engine, cfg, model_dir, hf = _stack(tiny_model_dir, enable_fastv=True, fastv_ratio=0.5,
+                                        fastv_layer=1, max_num_batched_tokens=512,
+                                        preemption="recompute", num_blocks=64, max_num_seqs=2)
+    ids = tiny_inputs["input_ids"][0].tolist()
+    engine.add_request(ids, SamplingParams(temperature=0.0, max_tokens=4, ignore_eos=True),
+                       pixel_values=tiny_inputs["pixel_values"],
+                       image_grid_thw=tiny_inputs["image_grid_thw"])
+    engine.step()  # prefill (and prune) completes; the sequence is now running
+    seq = engine.running[0]
+    assert seq.extra.get("fastv_will_prune")
+    assert engine._preempt_one() is True
+    assert seq.status == "swapped", (
+        "a FastV sequence was preempted by recompute; re-prefill would prune it a second time"
+    )
+    outs = engine.run_until_complete()
+    assert len(outs) == 1
+    assert outs[0].output_token_ids, "the preempted request must still finish"
+    # One pruning pass: at least half the submitted image tokens must have survived.
+    submitted = sum(1 for t in ids if t == cfg.image_token_id)
+    assert int(engine.stats()["vision_tokens_total"]) >= submitted // 2, (
+        "the sequence was pruned more than once"
+    )
+
+
+def test_cancel_finishes_a_sequence_and_frees_its_blocks(tiny_model_dir):
+    """The serving layer ends the HTTP stream when a stop string appears; without a cancel the
+    engine kept generating to max_tokens and cached a prefix nobody would reuse."""
+    engine, cfg, model_dir, hf = _stack(tiny_model_dir)
+    seq_id = engine.add_request(list(range(3, 25)),
+                                SamplingParams(temperature=0.0, max_tokens=32, ignore_eos=True))
+    engine.step()
+    free_before = engine.runner.block_manager.num_free
+    assert engine.cancel(seq_id) is True
+    assert not engine.has_work(), "cancelling the only request must leave the engine idle"
+    assert engine.runner.block_manager.num_free > free_before, "the sequence's blocks were not freed"
+    finished = [o for o in engine.finished if o.seq_id == seq_id]
+    assert finished and finished[0].finish_reason == "stop"
+    assert engine.cancel(seq_id) is False, "cancelling twice must report that nothing was live"
+
+
+def test_engine_config_rejects_unusable_limits():
+    with pytest.raises(ValueError, match="max_num_batched_tokens"):
+        EngineConfig(max_num_batched_tokens=0)
+    with pytest.raises(ValueError, match="max_model_len"):
+        EngineConfig(max_model_len=4, block_size=16)

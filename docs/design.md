@@ -32,6 +32,17 @@ underestimated all three of the latter.
 | `offload` | static placement + prefetch | `test_components.py::test_offload_*`; transfers must be measured on device |
 | `engine` | scheduling | `test_engine.py` |
 
+## Corrections to the v0.1 draft's numbers
+
+`docs/design-draft-v0.1.md` is kept as the historical draft.  Three of its figures were wrong
+and are corrected here rather than edited in place, so the review trail stays intact:
+
+* KV per token is **36 KiB**, not 18 (the draft forgot the K *and* V term: `2 x 36 layers x 2
+  kv_heads x 128 head_dim x 2 B`).
+* The vision tower is **668.8M** parameters (**~1.34 GB** in fp16), not 0.44B / 0.9 GB.
+* The 3B model is **3754.7M** parameters (**~7.51 GB** in bf16), not 6.2 GB -- which is why
+  fp16 does not fit in 8 GB and quantisation is the point.
+
 ## Decisions that changed after the external review
 
 ### 1. The KV budget was wrong, and the claim built on it was wrong

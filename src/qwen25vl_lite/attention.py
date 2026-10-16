@@ -4,7 +4,7 @@ The engine never *assumes* which SDPA backend will be selected -- the review of
 2026-10-15 was explicit that SM version alone does not determine this.  Instead
 :func:`probe_backends` actually runs a small SDPA call inside each backend's context
 manager and records whether it succeeded, and the chosen backend is reported to the user
-and written to logs.  ``--attn-backend`` pins a backend when you want reproducible numbers.
+and exposed on `/health` (nothing is logged).  ``--attn-backend`` pins a backend when you want reproducible numbers.
 
 The paged path is a gather-based reference: exact, dependency-free, and runnable anywhere
 (used in tests and on CPU).  There is deliberately no fused kernel here -- a compiled
@@ -342,6 +342,12 @@ def attention_with_probs(
     Only used where the weights themselves are the point (FastV-style pruning measures the
     attention share received by each image token).  Never on the hot path: materialising
     ``[batch, heads, q, k]`` is what the fused kernels exist to avoid.
+
+    When ``attn_mask`` is omitted the mask is causal, which is the only correct default for a
+    decoder.  ``query_offset`` is the absolute position of the first query; it is *required* to
+    be meaningful when ``q < k`` (a decode step), where it defaults to ``k - q`` -- the standard
+    assumption that the new tokens are the last ones.  Passing both an ``attn_mask`` and a
+    non-zero ``query_offset`` is refused rather than silently ignoring one of them.
     """
     head_dim = q.shape[-1]
     scale = scale if scale is not None else head_dim ** -0.5
@@ -349,8 +355,13 @@ def attention_with_probs(
     vv = repeat_kv(v, num_kv_groups) if num_kv_groups > 1 else v
     scores = torch.matmul(q.float(), kk.float().transpose(-2, -1)) * scale
     if attn_mask is not None:
+        if query_offset:
+            raise ValueError("pass either attn_mask or query_offset, not both")
         scores = scores + attn_mask
     else:
+        if query_offset == 0 and scores.shape[-1] > scores.shape[-2]:
+            # Decode shape with no mask: the queries are the last `q` positions.
+            query_offset = scores.shape[-1] - scores.shape[-2]
         # A decoder is causal, so the default must be a causal mask.  The earlier version masked
         # only when `k > q` (the decode/chunk case) and left a dense full-sequence pass unmasked
         # -- which is exactly the shape FastV's first stage runs in (q_len == k_len), so the

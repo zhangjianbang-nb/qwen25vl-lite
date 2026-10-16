@@ -159,25 +159,56 @@ class EngineService:
         )
         return seq_id, self._stream_until(seq_id)
 
-    def _stream_until(self, seq_id: int) -> Iterator[RequestOutput]:
-        """Yield progressively longer outputs for one sequence until it finishes."""
-        while True:
-            self.engine.step()
+    def _stream_until(self, seq_id: int, max_steps: int = 100_000,
+                      max_stall: int = 128) -> Iterator[RequestOutput]:
+        """Yield progressively longer outputs for one sequence until it finishes.
+
+        The loop is bounded and guarded.  An unbounded `while True` around `engine.step()` was a
+        hang waiting to happen: a request the scheduler can never admit produced no output and no
+        exit, and an exception from `step()` escaped past the HTTP handler (the caller only
+        guarded `add_request`) so the client saw a reset connection instead of an error.
+        """
+        steps = 0
+        stall = 0
+        marker = None
+        while steps < max_steps:
+            try:
+                self.engine.step()
+            except Exception as exc:  # noqa: BLE001 -- surface it as a request error, not a reset
+                yield RequestOutput(seq_id=seq_id, prompt_token_ids=[], output_token_ids=[],
+                                    finish_reason="error", error=str(exc))
+                return
+            steps += 1
             target = next((o for o in self.engine.finished if o.seq_id == seq_id), None)
             live = next((s for s in self.engine.running + self.engine.swapped if s.seq_id == seq_id), None)
             if target is not None:
                 yield target
                 return
             if live is None:
-                # The request is still waiting for admission.
+                # Still waiting for admission.  A request that never advances is a stall, not
+                # progress, so count identical states rather than spinning forever.
+                now = (len(self.engine.waiting), len(self.engine.running), len(self.engine.swapped))
+                stall = stall + 1 if now == marker else 0
+                marker = now
+                if stall >= max_stall:
+                    yield RequestOutput(seq_id=seq_id, prompt_token_ids=[], output_token_ids=[],
+                                        finish_reason="error",
+                                        error="request could not be scheduled (no free blocks)")
+                    return
                 yield RequestOutput(seq_id=seq_id, prompt_token_ids=[], output_token_ids=[], finish_reason="")
                 continue
+            marker = None
+            stall = 0
             yield RequestOutput(
                 seq_id=seq_id,
-                prompt_token_ids=list(live.prompt_token_ids),
+                # The prompt as submitted: FastV rewrites the engine's copy, and reporting that
+                # would hand the client a prompt it never sent.
+                prompt_token_ids=list(live.submitted_prompt_token_ids or live.prompt_token_ids),
                 output_token_ids=list(live.output_token_ids),
                 finish_reason="",
             )
+        yield RequestOutput(seq_id=seq_id, prompt_token_ids=[], output_token_ids=[],
+                            finish_reason="error", error=f"did not finish within {max_steps} steps")
 
     def decode(self, token_ids: Sequence[int]) -> str:
         if self.tokenizer is None:
@@ -339,6 +370,20 @@ def make_handler(service: EngineService):
                 last_reason = None
                 last_ids: List[int] = []
                 for update in stream:
+                    if update.error:
+                        # The engine reported a failure for this request (scheduling, FastV,
+                        # or a scheduler stall).  Surface it as a frame and end the stream --
+                        # previously it was silently dropped and the client got a bare "stop".
+                        self._sse({"id": completion_id,
+                                   "object": "chat.completion.chunk" if chat else "text_completion",
+                                   "created": created, "model": self.service_ref.model_name,
+                                   "error": {"message": update.error, "type": "server_error"},
+                                   "choices": [{"index": 0,
+                                                **({"delta": {}} if chat else {"text": ""}),
+                                                "finish_reason": "error"}]})
+                        self.wfile.write(b"data: [DONE]\n\n")
+                        self.wfile.flush()
+                        return
                     last_ids = list(update.output_token_ids)
                     if update.finish_reason:
                         last_reason = update.finish_reason
@@ -347,6 +392,9 @@ def make_handler(service: EngineService):
                     emitted = len(text)
                     hit_stop = len(text) < len(self.service_ref.decode(update.output_token_ids))
                     if hit_stop:
+                        # The stream ends here, so stop the engine too: otherwise it generates to
+                        # max_tokens and registers a prefix cache entry nobody will reuse.
+                        self.service_ref.engine.cancel(update.seq_id)
                         # A stop sequence was produced: emit what is left of the visible text
                         # and end the stream here rather than letting the model run on.
                         if chunk:
@@ -410,13 +458,22 @@ def make_handler(service: EngineService):
             for update in stream:
                 final = update
             assert final is not None
+            if final.error:
+                self._send_json({"error": {"message": final.error, "type": "server_error"}},
+                                status=500)
+                return
             text = _apply_stops(self.service_ref.decode(final.output_token_ids), stops)
+            # A stop string cut the text short, so the reason is "stop" -- the same thing the
+            # streaming path reports.  Leaving the engine's own reason ("length") made the two
+            # paths disagree about the same stop semantics.
+            reason = ("stop" if len(text) < len(self.service_ref.decode(final.output_token_ids))
+                      else final.finish_reason)
             if chat:
                 self._send_json({
                     "id": completion_id, "object": "chat.completion", "created": created,
                     "model": self.service_ref.model_name,
                     "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
-                                 "finish_reason": final.finish_reason}],
+                                 "finish_reason": reason}],
                     "usage": {
                         "prompt_tokens": final.num_prompt_tokens,
                         "completion_tokens": final.num_output_tokens,
@@ -427,7 +484,7 @@ def make_handler(service: EngineService):
                 self._send_json({
                     "id": completion_id, "object": "text_completion", "created": created,
                     "model": self.service_ref.model_name,
-                    "choices": [{"index": 0, "text": text, "finish_reason": final.finish_reason,
+                    "choices": [{"index": 0, "text": text, "finish_reason": reason,
                                  # Extension field: with no tokenizer `text` is empty, and the
                                  # token ids are then the only usable payload.  Present either way
                                  # so a client can rely on it.

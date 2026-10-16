@@ -22,6 +22,8 @@ from qwen25vl_lite.server import PreparedPrompt, SamplingParams, make_handler
 class _Update:
     output_token_ids: List[int]
     finish_reason: Optional[str] = None
+    seq_id: int = 0
+    error: Optional[str] = None
 
     @property
     def num_prompt_tokens(self) -> int:
@@ -32,11 +34,23 @@ class _Update:
         return len(self.output_token_ids)
 
 
+class _FakeEngine:
+    """Just enough engine for the handler: it must be cancellable when a stop string hits."""
+
+    def __init__(self) -> None:
+        self.cancelled: List[int] = []
+
+    def cancel(self, seq_id: int, reason: str = "stop") -> bool:
+        self.cancelled.append(seq_id)
+        return True
+
+
 class _FakeService:
     model_name = "fake"
 
     def __init__(self, updates: List[_Update]) -> None:
         self._updates = updates
+        self.engine = _FakeEngine()
 
     def decode(self, ids: List[int]) -> str:
         return "".join(chr(0x40 + i) for i in ids)
@@ -95,6 +109,8 @@ def test_stop_sequence_ends_the_stream_at_the_sequence():
     text = "".join(f["choices"][0].get("delta", {}).get("content", "") for f in rec.frames)
     assert text == "AB"
     assert rec.frames[-1]["choices"][0]["finish_reason"] == "stop"
+    # Ending the stream must also stop the engine: otherwise it runs on to max_tokens.
+    assert rec.service_ref.engine.cancelled == [0]
 
 
 def test_non_streaming_response_is_a_single_json_object():
@@ -108,8 +124,8 @@ def test_non_streaming_response_is_a_single_json_object():
 def test_completions_returns_token_ids_in_both_modes():
     """With no tokenizer `text` is an empty string, so the endpoint would be useless without the
     token ids.  They are an extension field and are present in the JSON response *and* in every
-    streaming chunk -- the streaming path used to omit them, which made the README's "always"
-    untrue."""
+    streaming chunk -- the streaming path used to omit them, so the README's claim that the ids
+    are always returned was untrue."""
     rec = _run([_Update([1, 2, 3], finish_reason="stop")], chat=False, body={"stream": False})
     choice = rec.json[0]["choices"][0]
     assert choice["token_ids"] == [1, 2, 3]
@@ -122,3 +138,45 @@ def test_completions_returns_token_ids_in_both_modes():
         "a streaming text_completion chunk omitted token_ids"
     )
     assert rec.frames[-1]["choices"][0]["token_ids"] == [1, 2]
+
+
+def test_non_streaming_stop_reports_stop_not_length():
+    """A stop string truncates the text, so the reason is "stop" -- the streaming path already
+    said so, and the two paths must not disagree about the same semantics."""
+    rec = _run([_Update([1, 2, 3], finish_reason="length")], chat=True,
+               body={"stream": False, "stop": ["C"]})
+    assert rec.json[0]["choices"][0]["finish_reason"] == "stop"
+
+
+def test_streaming_reports_a_scheduling_failure_instead_of_hanging():
+    """Two failure modes used to be invisible: an exception from `engine.step()` escaped past the
+    HTTP handler (the client saw a reset connection), and a request the scheduler never admits
+    looped forever yielding empty updates.  Both are now surfaced as a request error."""
+
+    class _BrokenEngine:
+        def cancel(self, seq_id, reason="stop"):
+            return True
+
+        def step(self):
+            raise RuntimeError("scheduler made no progress")
+
+    from qwen25vl_lite.server import EngineService
+
+    class _Stub:
+        def __init__(self):
+            self.engine = _BrokenEngine()
+
+    stub = _Stub()
+    first = next(EngineService._stream_until(stub, 0))
+    assert first.finish_reason == "error" and "no progress" in (first.error or ""), (
+        "a step() failure must become a request error, not an exception out of the handler"
+    )
+
+
+def test_streaming_error_frame_is_emitted():
+    """The engine can also report a failure on an output; the server must turn it into an error
+    frame instead of dropping it (which left the client with a bare "stop")."""
+    rec = _run([_Update([], finish_reason="error", error="request could not be scheduled")],
+               chat=True)
+    assert rec.frames[-1]["choices"][0]["finish_reason"] == "error"
+    assert rec.frames[-1]["error"]["message"] == "request could not be scheduled"

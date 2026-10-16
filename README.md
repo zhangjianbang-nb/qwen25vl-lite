@@ -41,7 +41,7 @@ qwen25vl-lite serve --model ./Qwen2.5-VL-3B-Instruct --device cuda --dtype float
 
 ```
 $ python -m pytest tests/
-135 passed in ~10s
+142 passed in ~10s
 ```
 
 Everything runs on CPU with tiny random weights and **no model download**, so the suite is
@@ -196,7 +196,8 @@ what prefill time and KV pressure are made of, and it needs no change to the che
 feature geometry. FastV is the riskier one, which is why it is a separate tier rather than a
 flag applied to the others.
 
-`pool_merge` (2x2 grid-preserving average pool) and `tome_merge` (bipartite soft matching)
+`pool_merge` (grid-preserving average pool over a `factor`-by-`factor` block of merge units,
+the factor being a parameter rather than a fixed 2) and `tome_merge` (bipartite soft matching)
 are implemented and unit-tested, but they are **not** wired into any tier, and the README
 does not claim otherwise. Both replace trained feature geometry — a pool averages merge units
 the checkpoint never averaged, ToME fuses tokens by similarity — so their quality cost is
@@ -298,7 +299,7 @@ Stated plainly, because the alternative is a user discovering them:
 
 ```bash
 pip install -e ".[dev]"              # pytest + the pinned transformers
-python -m pytest tests/              # 135 tests, CPU-only, no downloads
+python -m pytest tests/              # 142 tests, CPU-only, no downloads
 python -m pytest tests/test_model_vs_hf.py    # the equivalence gate on its own
 python -m pytest tests/test_chunked_prefill.py
 ```
@@ -311,10 +312,12 @@ pins exactly that version. A reference implementation is allowed to change its i
 between releases, and 5.20 did: it renamed a rotary-embedding class, replaced
 `apply_multimodal_rotary_pos_emb` with a generic helper, and moved the MRoPE interleave into
 the cos/sin tables. So "matches transformers" is a claim about a version, not a moving target.
-The two tests that inspect HF internals use instantiated modules rather than private class
-names and skip with a stated reason on other versions; the end-to-end equivalence tests run
-everywhere. On the pinned 5.16.1 the suite is 135 passed; under 5.20 it is 133 passed and
-2 skipped (135 collected). That second number was produced by running the suite in a scratch virtualenv with
+The tests that inspect HF internals use instantiated modules rather than private class names
+where the API allows it, and skip with a stated reason on versions that moved the internals;
+one test (`test_vision_tower_matches_hf`) does import a HF class directly, so it is the one that
+would need attention if that class is renamed again.  The end-to-end equivalence tests run
+everywhere. On the pinned 5.16.1 the suite is 142 passed; under 5.20 it is 140 passed and
+2 skipped (142 collected). That second number was produced by running the suite in a scratch virtualenv with
 `pip install -U transformers`; it is not reproducible from the pinned `dev` extra by design,
 because the pin exists to keep CI on the verified version.
 

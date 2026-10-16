@@ -17,8 +17,10 @@ Usage::
     python scripts/quality_gate.py --model /path/to/model --gate B --schemes float32,int8,int4
     python scripts/quality_gate.py --model /path/to/model --gate C --tiers full,half,thumbnail
 
-Without ``--model`` it builds a tiny random-weight model, so the harness itself is runnable
-anywhere.  The numbers it prints on random weights are meaningless as *quality*; they are
+It never downloads anything and never loads a large checkpoint implicitly: pass ``--model``
+for a real snapshot, or ``--tiny`` to build a small random-weight fixture in-process.  Running
+with neither is refused, because on a machine that is already serving a model, silently
+building one is exactly the accident the guard exists to prevent.  The numbers it prints on random weights are meaningless as *quality*; they are
 meaningful as *mechanism* (does the pipeline run, and does the difference grow as expected).
 """
 

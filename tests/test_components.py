@@ -900,3 +900,18 @@ def test_int4_axis_1_reports_features_in_the_original_orientation():
     assert tuple(qt.shape) == (32, 64)
     assert qt.out_features == 32
     assert qt.in_features == 64
+
+
+def test_attention_with_probs_defaults_the_offset_for_a_decode_step():
+    """With no mask and q < k the queries are the last positions, so the default offset is k - q.
+    Without it the mask would let a decode query see only position 0 and lose its whole context."""
+    torch.manual_seed(0)
+    q = torch.randn(1, 2, 1, 8)
+    k = torch.randn(1, 2, 5, 8)
+    v = torch.randn(1, 2, 5, 8)
+    _out, probs = attention_with_probs(q, k, v)
+    assert float(probs[0, 0, 0, :4].sum()) > 1e-6, "a decode query attended to nothing before it"
+    assert float(probs[0, 0, 0, 4]) > 1e-6
+
+    with pytest.raises(ValueError, match="not both"):
+        attention_with_probs(q, k, v, attn_mask=torch.zeros(1, 1, 1, 5), query_offset=4)

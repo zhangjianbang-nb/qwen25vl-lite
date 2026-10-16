@@ -41,7 +41,7 @@ GPU-measured performance numbers ship with it (see "Not included" below).
   machine's reclaimable memory.
 - **Quality gates** (`scripts/quality_gate.py`): Gate A against `transformers`, Gate B per
   quantisation scheme, Gate C per vision tier. Runnable without a real checkpoint (`--tiny`).
-- **Tests**: 135 tests, CPU-only, no checkpoint download. Includes a 20-combination chunked
+- **Tests**: 142 tests, CPU-only, no checkpoint download. Includes a 20-combination chunked
   prefill equivalence matrix, step-by-step paged-decode parity with HF, batched-vs-sequential
   decode parity, prefix-cache reuse parity, greedy generation parity with
   `transformers.generate`, and a multimodal case with a large enough image to engage windowed
@@ -105,7 +105,7 @@ Two changes:
   and skip with an explicit reason on versions whose convention differs. The end-to-end
   equivalence tests run on every version and pass on both 5.16.1 and 5.20.
 
-Result: `pytest tests/` → 135 passed on 5.16.1; under 5.20 it is 133 passed and 2 skipped (135 collected). (Note that
+Result: `pytest tests/` → 142 passed on 5.16.1; under 5.20 it is 140 passed and 2 skipped (142 collected). (Note that
 `pyproject.toml` already sets `addopts = "-q"`, so adding `-q` again suppresses the summary
 line — the counts above come from `pytest tests/`.)
 
@@ -290,7 +290,53 @@ two defects in FastV itself that the earlier rounds had not touched:
   instantiated), README's serve example passed `--kv-dtype float16` with the default float32
   compute dtype (which cannot work), and `design.md` described cache eviction as leaf-only (it
   evicts any subtree with no live user).
-- The test count in the previous entry was itself wrong; the suite is 135 tests.
+- The test count in the previous entry was itself wrong; the suite is 142 tests.
+
+### Fixed after the fifth validation round (2026-10-15)
+
+The re-scoring pass (74/100 and 82/100) confirmed the previous fixes and found what they had
+missed or introduced:
+
+- **Recompute preemption pruned a FastV sequence twice.** `_preempt_one` resets the counters but
+  cannot restore the prompt FastV rewrote in place, so re-prefilling pruned an already-pruned
+  sequence and the output depended on whether a preemption happened. A pruned request is now
+  preempted by **swap**, which never re-runs prefill.
+- **The new "prompt does not fit" error bricked the engine.** It was raised from inside the
+  scheduler, before the request left the queue, so every later step failed on the same request
+  and unrelated work stopped with it. The check moved to `add_request`, where it belongs, and the
+  scheduler keeps a guard that cannot be reached.
+- **`rope_delta` after pruning used the largest *surviving* position.** If the last image token
+  was pruned, that is smaller than the cursor and decoding restarted inside the prompt's own
+  coordinate range. It is now derived from the original cursor
+  (`rope_delta + original_len - new_len`).
+- **The streaming loop had no termination condition and no exception handling.** `engine.step()`
+  ran outside any `try`, so a failure escaped the HTTP handler and the client saw a reset
+  connection; and a request the scheduler never admits produced empty updates forever. The loop
+  is bounded, guarded, and reports both cases as a request error frame.
+- **A stop string ended the HTTP stream but not the request**, so the engine generated to
+  `max_tokens` and cached a prefix nobody would reuse. `LLMEngine.cancel` now finishes the
+  request and frees its blocks.
+- **Engine-reported errors were dropped in streaming mode** (the client got a bare "stop"); they
+  are an error frame now, and a 500 in the non-streaming path.
+- **The non-streaming path reported the engine's finish reason after a stop truncation**, so the
+  two paths disagreed about the same stop semantics.
+- **`attention_with_probs` lost the whole context for a decode-shaped call with no mask** (the
+  default offset was 0, so only position 0 was visible). The default is now `k - q`, and passing
+  both a mask and a non-zero offset is refused instead of silently ignoring one.
+- **`want_probs` with a KV cache was silently wrong** for heterogeneous batches (one scalar
+  offset for the whole batch); it is refused now, since probabilities are only wanted for the
+  FastV dense pass, which has no cache.
+- **`vision_tokens_total` counted twice after a recompute preemption** and missed tokens served
+  from a cache hit; it is counted once per request now.
+- **FastV's pruned hidden states were computed twice** (the helper's output was discarded and the
+  slice re-done inline).
+- Minor: `EngineConfig` validates `max_num_batched_tokens > 0` and `max_model_len >= block_size`;
+  `BlockManager` keeps a set alongside its free list so releasing a batch is not O(n^2).
+- Documentation: `attention.py` no longer says the backend is logged; the CHANGELOG no longer
+  claims all four gate fixes have tests (two are exercised by running the gate script);
+  `quality_gate.py`'s docstring says `--tiny` is required; README says three tests touch HF
+  internals and that `pool_merge`'s factor is a parameter; `design.md` records the v0.1 draft's
+  three wrong figures (KV, vision tower, 3B total) instead of leaving them uncorrected.
 
 ### Not included
 
