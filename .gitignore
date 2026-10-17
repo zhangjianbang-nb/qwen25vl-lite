@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+*.so
+.DS_Store
+
+# Model checkpoints.  A Qwen2.5-VL-3B snapshot is ~7 GB across two ~3.5 GB shards, and GitHub
+# rejects any file over 100 MB, so committing it would either fail the push or bloat the
+# history irrecoverably.  Fetch the weights from HuggingFace instead; the tests build a tiny
+# random-weight model on the fly and need no checkpoint at all.
+Qwen2.5-VL-*/
+*.safetensors
+
+# Local scratch.  `.deploy-notes/` holds launch scripts and probes from this machine *and*
+# private content: webcam photos used for vision checks, a desktop screenshot, webui uploads
+# and request logs.  It must never be committed.  Anything worth publishing belongs in
+# `scripts/` or `docs/` instead.
+.deploy-notes/
+
+# Logs and scratch output
+*.log
